@@ -11,7 +11,16 @@ from jax.typing import ArrayLike
 from .internals import SpectralNorm
 
 # Hyperparameters
+NUM_ENVS = 64
+FRAME_STACK = 4
 BATCH_SIZE = 256
+BUFFER_SIZE = 1000_000
+TRAIN_START_BUF_SIZE = 200_000
+
+# TODO: verify these
+PER_ALPHA = 0.2
+PER_BETA = 1.0
+PER_EPSILON = 1e-3
 
 LEARNING_RATE = 1e-4
 ADAM_EPS = 0.005 / BATCH_SIZE
@@ -19,6 +28,7 @@ DISCOUNT = 0.997
 N_STEP = 3
 
 IQN_TRAIN_SAMPLES = 8
+IQN_ACT_SAMPLES = 32
 IQN_NUM_COS = 64
 IQN_HUBER_LOSS_K = 1.0
 GRADIENT_CLIPPING_MAX_NORM = 10
@@ -30,12 +40,9 @@ MUNCHAUSEN_TEMPERATURE = 0.03
 MUNCHAUSEN_SCALING_TERM = 0.9
 MUNCHAUSEN_CLIPPING_VAL = -1.0
 
-
-# TODO: Implement the multi-step prioritised replay buffer
-# TODO: Implement train step
-# TODO: Check spectral normalisation for correctness (esp. in the target network).
-#       Turns out NNX is again different from PyTorch in that they decided to have
-#       SN mutate the weights instead of IDK... Maybe we'll need to implement it from scratch.
+# TODO: Check spectral normalisation for correctness. internals.SpectralNorm now restores
+#       the raw params after each call, so it projects rather than mutating; what is left is
+#       that update_stats is always True (see below).
 # TODO: Add improvements to deal with primacy bias and increase RR (e.g. layer / batch norm)
 # TODO: Integrate some tracking method like TensorBoard
 
@@ -44,48 +51,66 @@ MUNCHAUSEN_CLIPPING_VAL = -1.0
 # +--------------+
 
 # === Broken right now ===
-# TODO: BATCH_SIZE is unused.
+# TODO: SpectralNorm runs with update_stats=True on every forward pass. act() therefore
+#       mutates the training net's power-iteration state, and the target net advances its
+#       own u/sigma between hard copies (only to have them overwritten by update_target).
+#       For the target, one call after nnx.clone does it:
+#         target_qnet.set_attributes(use_running_average=True, raise_if_not_found=False)
+#       For act(), thread update_stats through ImpalaResSubBlock / ImpalaBlock /
+#       ImpalaCNNLarge / QNet, or give act() its own inference net (see below).
 
 # === Correctness to settle ===
 # TODO: decide the Munchausen n-step scale: add MUNCHAUSEN_N_STEP_SCALE, ablate
 #       1.0 vs (γ^n-1)/(γ-1). Clip before scaling.
-# TODO: NoisyLinear noise is shared across the whole batch. That matches the
-#       original, but check whether per-sample noise helps gradient diversity.
+# TODO: NoisyLinear draws independent noise per batch element AND per quantile sample
+#       (eps shapes are [B, K, features]). The original draws one factorised pair per
+#       forward pass, shared across the batch. Decide which, and ablate.
 # TODO: act() is effectively argmax already (q/τ has spread ~1e4). Switch to argmax
 #       and drop rngs.actions; NoisyNets is the exploration mechanism.
 # TODO: verify NoisyLinear sigma params are actually receiving gradient and their
 #       magnitude decays over training (standard NoisyNets diagnostic).
+# TODO: decide priority definition: per-transition loss vs |mean TD error|. Note the
+#       stored value is PER_EPSILON + loss**PER_ALPHA, not the usual (|δ| + ε)**α, and
+#       the loss is a *sum* over IQN_TRAIN_SAMPLES quantiles -- so changing K rescales
+#       every priority.
+# TODO: PER_BETA is pinned at 1.0. Standard PER anneals 0.4 -> 1.0 over training; decide
+#       whether to anneal and where the schedule lives.
+# TODO: n_steps and discount are passed to buf.sample() in __init__.main but defaulted in
+#       train_step(). They must agree; thread one value through instead of two defaults.
 
 # === Missing core pieces ===
-# TODO: multi-step prioritised replay buffer.
-#       - n-step windows must not cross episode boundaries
-#       - Gymnasium >=1.0 vector envs use next-step autoreset: the step AFTER a
-#         termination returns the reset obs with reward 0 and done False and
-#         ignores the action. That transition must never enter the buffer.
-#       - store obs as uint8, index frames rather than storing stacks (4x memory)
-#       - decide: numpy sum-tree on host vs. jax-side sampling
-# TODO: decide priority definition: per-transition loss vs |mean TD error|.
-# TODO: real train step, decoupled from the env loop; warmup before first update.
+# TODO: real train step, decoupled from the env loop (warmup already exists via
+#       TRAIN_START_BUF_SIZE).
 # TODO: separate inference net for act(), synced from the training net.
 # TODO: evaluation loop with unclipped rewards and no sticky-action mismatch.
 # TODO: logging (TensorBoard or wandb): return, loss, Q magnitude, TD error,
 #       grad norm, σ per SN layer, NoisyNet σ, dead-unit fraction, fps.
-# TODO: checkpointing (orbax) — 12h runs will crash at hour 11.
-# TODO: seeding: one Rngs per concern, reproducible across restarts.
+# TODO: checkpointing — the orbax dep is pinned to the `orbax` meta-package (>=0.1.9);
+#       the checkpointer lives in `orbax-checkpoint`. Fix the dep before writing this.
+# TODO: seeding: one Rngs per concern, reproducible across restarts. nnx.Rngs(SEED) gives
+#       a single default stream, so rngs.noise / .samples / .actions all share one counter.
+# TODO: envpool is a hard dependency but only a.py imports it. Move it to a bench extra
+#       or drop it once the ALE-vs-envpool question in a.py is settled.
 
 # === Performance ===
-# TODO: overlap learner and actor — dispatch opt_step (async) BEFORE env.step,
+# TODO: overlap learner and actor — dispatch train_step (async) BEFORE env.step,
 #       block only when the result is actually needed.
 # TODO: donate_argnums on the jitted steps to avoid param copies.
 # TODO: check replay sampling isn't the bottleneck; prefetch batches on a thread.
 # TODO: try bf16 for the conv trunk, fp32 for the head and loss.
-# TODO: measure whether act() should use fewer than K=32 samples.
+# TODO: the per-(batch, quantile) NoisyLinear noise costs ~B*K*(in+out) normals per layer
+#       per call (~4.7M for the 2304->512 layers at B=256, K=8). Measure it before
+#       optimising anything else in the head.
+# TODO: measure whether act() should use fewer than IQN_ACT_SAMPLES quantiles.
 # TODO: profile with jax.profiler; check whether the Impala trunk or the buffer dominates.
 
 # === Reproduction / tuning ===
 # TODO: replay ratio: with 64 envs and a 1:1 act/train schedule and batch 256,
 #       each collected transition is replayed ~4x. Check that against the paper.
-# TODO: target update every 500 gradient steps = 32k env steps here. Verify.
+# TODO: target update every 500 gradient steps = 32k env steps -- the arithmetic checks
+#       out for the current 1:1 loop, but confirm 500 is what BTR actually uses.
+# TODO: SpectralNorm wraps only the two convs inside ImpalaResSubBlock, not ImpalaBlock's
+#       stem conv. Check that against BTR.
 # TODO: verify against BTR's reported Breakout curve before adding anything new.
 
 # === Experimental / longer term ===
@@ -277,7 +302,9 @@ class ImpalaCNNLarge(nnx.Module):
         x = self.block0(x)
         x = self.block1(x)
         x = self.block2(x)
-        x = nnx.relu(x)  # TODO: Should this ReLU be here?
+        # Impala ends its trunk on a ReLU. Order against the pool is irrelevant:
+        # relu is monotonic, so max(relu(x)) == relu(max(x)).
+        x = nnx.relu(x)
         x = adaptive_max_pool(cast(jax.Array, x), (6, 6))
         return x.reshape(*x.shape[:-3], -1)
 
@@ -303,10 +330,16 @@ class IQNCosineEmbedding(nnx.Module):
 
 
 class QNet(nnx.Module):
-    def __init__(self, num_actions: int, *, rngs: nnx.Rngs) -> None:
+    def __init__(
+        self,
+        num_actions: int,
+        *,
+        obs_stack: int = FRAME_STACK,
+        rngs: nnx.Rngs,
+    ) -> None:
         self.num_actions = num_actions
 
-        self.decoder = ImpalaCNNLarge(4, rngs=rngs)
+        self.decoder = ImpalaCNNLarge(obs_stack, rngs=rngs)
         self.quantile_embedding = IQNCosineEmbedding(
             self.decoder.out_features, rngs=rngs
         )
@@ -355,16 +388,18 @@ class QNet(nnx.Module):
 
 
 def norm_obs(obs: ArrayLike) -> jax.Array:
+    obs = jnp.moveaxis(obs, -3, -1)
     return jnp.astype(obs, jnp.float32) / 255
 
 
-@nnx.jit
+# num_samples sizes the quantile draw, so it has to be static.
+@nnx.jit(static_argnames=("num_samples",))
 def act(
     qnet: QNet,
     obs: ArrayLike,
     *,
     rngs: nnx.Rngs,
-    num_samples: int = 32,
+    num_samples: int = IQN_ACT_SAMPLES,
     temperature: float = MUNCHAUSEN_TEMPERATURE,
 ) -> jax.Array:
     obs = norm_obs(obs)
@@ -377,13 +412,13 @@ def act(
     return rngs.actions.categorical(logits)
 
 
-@nnx.jit
-def opt_step(
+@nnx.jit(static_argnames=("num_samples", "n_steps"))
+def train_step(
     *,
     qnet: QNet,
     target_qnet: QNet,
     opt: nnx.Optimizer,
-    importance_sampling_weights: ArrayLike,
+    sample_prios: ArrayLike,
     obs: ArrayLike,
     actions: ArrayLike,
     rewards: ArrayLike,
@@ -404,7 +439,13 @@ def opt_step(
     dones = jnp.expand_dims(dones, -1)
     next_obs = norm_obs(next_obs)
 
-    # TODO: check this correct
+    # The buffer hands back raw stored priorities, not p / sum_prios. That is fine here:
+    # normalising by the batch maximum cancels any constant factor, so neither sum_prios
+    # nor the buffer's length is needed. Keep this [batch], not [batch, 1] -- broadcasting
+    # it against transition_losses would silently reduce to mean(w) * mean(loss).
+    importance_sampling_weights = jnp.asarray(sample_prios) ** -PER_BETA
+    importance_sampling_weights /= jnp.max(importance_sampling_weights)
+
     def loss_fn(qnet: QNet, target_qnet: QNet, rngs: nnx.Rngs):
         target_qnet_qs = target_qnet.random_n_samples_mean(obs, num_samples, rngs=rngs)
         target_logits = nnx.log_softmax(target_qnet_qs / temperature)
@@ -420,7 +461,7 @@ def opt_step(
         target_next_q_quants = target_qnet(next_obs, samples=next_samples, rngs=rngs)
         target_next_qs = target_next_q_quants.mean(-2, keepdims=True)
 
-        # TODO: Should I compute softmax twice instead?
+        # exp(log_softmax(.)) rather than a second softmax: same numerics, one reduction.
         target_next_logits = nnx.log_softmax(target_next_qs / temperature)
         target_next_probs = jnp.exp(target_next_logits)
 
@@ -430,7 +471,9 @@ def opt_step(
             -1,
         )
 
-        # TODO: discount to the power of multi-step n?
+        # One discount ** n_steps for the whole batch is right: the buffer accumulates the
+        # n-step return itself and redraws any rollout a time limit would have cut short,
+        # so every drawn transition spans exactly n_steps or ends terminal.
         target_q_quants = (
             munchausen_rewards
             + jnp.where(dones, 0, discount**n_steps) * next_value_quants
@@ -453,12 +496,16 @@ def opt_step(
             importance_sampling_weights * transition_losses
         ), transition_losses
 
+    _loss: jax.Array
+    transition_losses: jax.Array
     (_loss, transition_losses), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
         qnet, target_qnet, rngs
     )
     opt.update(qnet, grads)
 
-    return transition_losses
+    # TODO: see the priority-definition entry at the top -- loss vs |TD error|, and the
+    #       non-standard epsilon placement.
+    return PER_EPSILON + transition_losses**PER_ALPHA
 
 
 # Once every TARGET_NETWORK_UPDATE_FREQ steps

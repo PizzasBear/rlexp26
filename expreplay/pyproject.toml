@@ -1,0 +1,15 @@
+[project]
+name = "expreplay"
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+]
+dynamic = ["version"]
+
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "**/*.rs" }, { file = "**/*.pyi" }]

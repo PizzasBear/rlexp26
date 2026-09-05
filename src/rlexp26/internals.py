@@ -200,14 +200,14 @@ class WeightNorm(nnx.Module):
         Returns:
           Output of the layer using l2-normalized weights.
         """
-        state = nnx.state(self.layer_instance)
+        state = nnx.state(self.layer_instance, nnx.Param)  # fix: use nnx.Param
 
         originals: list[tuple[nnx.Param, Array]] = []
-        for path, param in nnx.to_flat_state(state):
-            originals.append((param, param[...]))
-            self._weightnorm_inplace(path, param)
-
         try:
+            for path, param in nnx.to_flat_state(state):
+                originals.append((param, param[...]))
+                self._weightnorm_inplace(path, param)
+
             return self.layer_instance(x, *args, **kwargs)  # type: ignore
         finally:
             # fix: reset parameter values after we modified them in-place
@@ -374,11 +374,11 @@ class SpectralNorm(Module):
         state = nnx.state(self.layer_instance, nnx.Param)
 
         originals: list[tuple[nnx.Param, Array]] = []
-        for path, param in nnx.to_flat_state(state):
-            originals.append((param, param[...]))
-            self._spectral_normalize_inplace(path, param, update_stats=update_stats)
-
         try:
+            for path, param in nnx.to_flat_state(state):
+                originals.append((param, param[...]))
+                self._spectral_normalize_inplace(path, param, update_stats=update_stats)
+
             return self.layer_instance(x)
         finally:
             # fix: reset parameter values after we modified them in-place
