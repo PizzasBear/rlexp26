@@ -91,11 +91,14 @@ def main() -> None:
     # TODO: Should I save to the replay buffer in a worker thread to parallelise?
     # TODO: Should I sample batches in a background thread and then queue them for parallel CPU-GPU transfer?
     # TODO: Should I queue priority updates to parallelise GPU-CPU transfer?
+    #       (this is the cheapest of the four -- see the overlap entry in btr.py, and note it
+    #        also fixes the recycled-slot priority bug flagged at the bottom of this loop)
 
-    # Current pre-train-start CPU util: 60%
-
-    # Current normal CPU util: 10%-15%
-    # Current normal GPU util: 70%-80%
+    # Measured 2026-09-06, 3080 + 24-thread host, 64 envs, batch 256:
+    #   pre-train-start: ~1000 env steps/s
+    #   steady state:    ~910 env steps/s (~3.6k ALE frames/s), i.e. ~15h for 50M env steps
+    #   GPU 80% util, 324W of a 370W cap, 84C -- power/thermally limited, so it is the wall
+    #   host CPU ~1.4 cores of 24 (main thread ~40%, 16 ALE threads ~5% each): not the wall
 
     # General:
     # TODO: Every once in a while run an evaluation run to display progress

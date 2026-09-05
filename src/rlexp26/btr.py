@@ -41,72 +41,88 @@ MUNCHAUSEN_TEMPERATURE = 0.03
 MUNCHAUSEN_SCALING_TERM = 0.9
 MUNCHAUSEN_CLIPPING_VAL = -1.0
 
-# TODO: Check spectral normalisation for correctness. internals.SpectralNorm now restores
-#       the raw params after each call, so it projects rather than mutating; what is left is
-#       that update_stats is always True (see below).
+# TODO: Check spectral normalisation for correctness. internals.SpectralNorm restores the raw
+#       params after each call, so it projects rather than mutating, and sync_qnet pins the
+#       target and inference nets to use_running_average=True -- verified: the flag survives
+#       the jit boundary, a forward pass on a synced net leaves u untouched, and sync_qnet
+#       compiles twice in total rather than per call. What is left is the projection itself.
 # TODO: Add improvements to deal with primacy bias and increase RR (e.g. layer / batch norm)
-# TODO: Integrate some tracking method like TensorBoard
 
 # +--------------+
 # | AI Generated |
 # +--------------+
 
 # === Broken right now ===
-# TODO: SpectralNorm runs with update_stats=True on every forward pass. act() therefore
-#       mutates the training net's power-iteration state, and the target net advances its
-#       own u/sigma between hard copies (only to have them overwritten by update_target).
-#       For the target, one call after nnx.clone does it:
-#         target_qnet.set_attributes(use_running_average=True, raise_if_not_found=False)
-#       For act(), thread update_stats through ImpalaResSubBlock / ImpalaBlock /
-#       ImpalaCNNLarge / QNet, or give act() its own inference net (see below).
+# TODO: priorities are written back after save_step, so once the buffer has wrapped, a slot
+#       sampled this iteration can already have been recycled by the time update_prios lands
+#       and inherits the previous occupant's priority. Both candidate fixes are spelled out
+#       at the bottom of __init__.main; the second one also unblocks the overlap win below.
+# TODO: the target update is keyed on the env-loop counter, which only equals the gradient-step
+#       count while the act/train ratio stays 1:1. Count updates instead (see __init__.main).
 
 # === Correctness to settle ===
 # TODO: decide the Munchausen n-step scale: add MUNCHAUSEN_N_STEP_SCALE, ablate
 #       1.0 vs (γ^n-1)/(γ-1). Clip before scaling.
-# TODO: NoisyLinear used to draw independent noise per batch element AND per quantile sample
-#       (eps shapes are [B, K, features]). The original draws one factorised pair per
-#       forward pass, shared across the batch. Decide which, and ablate.
+# TODO: NoisyLinear now draws one factorised pair per __call__, shared across the batch and
+#       the quantile axis, which matches the original. What is left: loss_fn calls target_qnet
+#       twice (Munchausen term, then the next-state quantiles) and each call redraws, so the
+#       two target evaluations see different noise. Decide whether they should share a draw.
 # TODO: act() is effectively argmax already (q/τ has spread ~1e4). Switch to argmax
 #       and drop rngs.actions; NoisyNets is the exploration mechanism.
 # TODO: verify NoisyLinear sigma params are actually receiving gradient and their
-#       magnitude decays over training (standard NoisyNets diagnostic).
-# TODO: decide priority definition: per-transition loss vs |mean TD error|. Note the
-#       stored value is PER_EPSILON + loss**PER_ALPHA, not the usual (|δ| + ε)**α, and
-#       the loss is a *sum* over IQN_TRAIN_SAMPLES quantiles -- so changing K rescales
-#       every priority.
+#       magnitude decays over training (standard NoisyNets diagnostic). This wants the σ
+#       scalars from the logging entry below -- a one-off grad probe outside train_step
+#       trips Flax's trace-level guard on the shared Rngs counter.
+# TODO: decide priority definition: per-transition loss vs |mean TD error|. The stored value
+#       is (loss / IQN_TRAIN_SAMPLES + PER_EPSILON) ** PER_ALPHA -- the ε floor is inside the
+#       exponent, and averaging out the quantile sum means K no longer rescales priorities,
+#       but it is still a loss rather than the usual |δ|.
 # TODO: PER_BETA is pinned at 1.0. Standard PER anneals 0.4 -> 1.0 over training; decide
 #       whether to anneal and where the schedule lives. Check how BTR does it.
-# TODO: n_steps and discount are passed to buf.sample() in __init__.main but defaulted in
-#       train_step(). They must agree; thread one value through instead of two defaults.
+# TODO: the pre-loop act() in __init__.main runs on qnet, and the step-0 act() runs on
+#       inference_qnet before its first sync_qnet, so both advance power-iteration state once
+#       with update_stats=True. Harmless at this scale, but it is a real asymmetry.
 
 # === Missing core pieces ===
-# TODO: real train step, decoupled from the env loop (warmup already exists via
-#       TRAIN_START_BUF_SIZE).
-# TODO: evaluation loop with unclipped rewards and no sticky-action mismatch.
-# TODO: logging (TensorBoard or wandb): return, loss, Q magnitude, TD error,
-#       grad norm, σ per SN layer, NoisyNet σ, dead-unit fraction, fps.
-# TODO: checkpointing — the orbax dep is pinned to the `orbax` meta-package (>=0.1.9);
-#       the checkpointer lives in `orbax-checkpoint`. Fix the dep before writing this.
+# TODO: evaluation loop with unclipped rewards and no sticky-action mismatch. The only number
+#       logged today is a 0.99-EMA of env 0's *clipped* return under NoisyNet noise, which
+#       undercounts the real score (bricks are worth 1/4/7 unclipped).
+# TODO: logging: TensorBoard is wired up, but avg_training_returns is the only scalar written.
+#       Still missing: loss, Q magnitude, TD error, grad norm, σ per SN layer, NoisyNet σ,
+#       dead-unit fraction, fps, buffer fill, and a real step counter (see __init__.main).
+# TODO: checkpointing: orbax-checkpoint is a direct dep now and save_async writes qnet state
+#       on every target sync. Still missing: a restore path, and optimizer / rngs / step /
+#       buffer state in the checkpoint -- as it stands a run cannot actually be resumed.
 # TODO: seeding: one Rngs per concern, reproducible across restarts. nnx.Rngs(SEED) gives
 #       a single default stream, so rngs.noise / .samples / .actions all share one counter.
-# TODO: envpool is a hard dependency but only a.py imports it. Move it to a bench extra
-#       or drop it once the ALE-vs-envpool question in a.py is settled.
+# TODO: envpool is a hard dependency but nothing in the package imports it; the only user was
+#       the throughput bench, now parked at ai-written-env-bench.py.bak. Move it to a bench
+#       extra or drop it once the ALE-vs-envpool question is settled.
 
 # === Performance ===
-# TODO: overlap learner and actor — dispatch train_step (async) BEFORE env.step,
-#       block only when the result is actually needed.
+# Measured 2026-09-06, 3080 + 24-thread host, 64 envs, batch 256, 1:1 act/train, steady state:
+# ~910 env steps/s (~3.6k ALE frames/s) => ~15h for 50M env steps / 200M frames.
+# GPU 80% util at 324W/370W and 84C; host CPU ~1.4 cores of 24. The GPU is the wall, and it is
+# already at its power/thermal limit, so wins have to come from doing less work on it.
+# TODO: the loop drains *both* async results before the next env.step -- device_get on the
+#       actions, then device_get on new_prios for update_prios -- so the GPU sits idle for the
+#       whole of env.step + buf.sample. Deferring update_prios by one iteration lets train_step
+#       overlap env.step; it interacts with the recycled-slot bug above, so fix them together.
+# TODO: bf16 for the conv trunk, fp32 for the head and loss. The trunk is ~440 MFLOP/sample
+#       and runs three times per train step (online obs, target obs, target next_obs) plus
+#       once per act, so it is ~6x the head; ~8.5 TFLOP/s achieved against 29.8 fp32 / 59.5
+#       TF32 peak. Check which precision XLA is actually picking for the convs first.
 # TODO: donate_argnums on the jitted steps to avoid param copies.
 # TODO: check replay sampling isn't the bottleneck; prefetch batches on a thread.
-# TODO: try bf16 for the conv trunk, fp32 for the head and loss.
-# TODO: the per-(batch, quantile) NoisyLinear noise costs ~B*K*(in+out) normals per layer
-#       per call (~4.7M for the 2304->512 layers at B=256, K=8). Measure it before
-#       optimising anything else in the head.
-# TODO: measure whether act() should use fewer than IQN_ACT_SAMPLES quantiles.
+# TODO: measure whether act() should use fewer than IQN_ACT_SAMPLES quantiles. 32 quantiles
+#       through the 2304->512 head for all 64 envs every step, with NoisyLinear doubling
+#       every matmul; 8 would very likely leave the argmax unchanged.
 # TODO: profile with jax.profiler; check whether the Impala trunk or the buffer dominates.
 
 # === Reproduction / tuning ===
-# TODO: replay ratio: with 64 envs and a 1:1 act/train schedule and batch 256,
-#       each collected transition is replayed ~4x. Check that against the paper.
+# TODO: replay ratio: 64 new transitions and one batch of 256 per iteration, so each collected
+#       transition is replayed ~4x (Rainbow's 32/4 schedule is 8x). Check against the paper --
+#       this is also the one knob that trades wall time against sample efficiency directly.
 # TODO: target update every 500 gradient steps = 32k env steps -- the arithmetic checks
 #       out for the current 1:1 loop, but confirm 500 is what BTR actually uses.
 # TODO: SpectralNorm wraps only the two convs inside ImpalaResSubBlock, not ImpalaBlock's
@@ -510,7 +526,9 @@ def train_step(
 # Once every TARGET_NETWORK_UPDATE_FREQ steps
 @nnx.jit
 def sync_qnet(qnet: QNet, target_qnet: QNet):
-    # TODO: Make sure this works how I expect it to with JIT and doesn't recompile on every run.
+    # set_attributes below flips a static attribute, so this compiles once for the
+    # use_running_average=False graphdef (the first call after nnx.clone) and once for the
+    # True one, then hits cache. Verified; not a per-call retrace.
 
     # Copy parameters
     nnx.update(target_qnet, nnx.state(qnet))
