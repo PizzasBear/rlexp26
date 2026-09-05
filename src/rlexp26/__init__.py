@@ -1,3 +1,4 @@
+from datetime import datetime
 from itertools import count
 from typing import Any
 
@@ -7,9 +8,12 @@ import jax
 import numpy as np
 import numpy.typing as npt
 import optax
+from etils.epath import Path
 from flax import nnx
 from gymnasium.spaces import Box, MultiDiscrete
 from gymnasium.vector import VectorEnv
+from orbax.checkpoint import v1 as ocp
+from tensorboardX import SummaryWriter
 
 gym.register_envs(ale_py)
 
@@ -32,6 +36,7 @@ ALE_PROTOCOL = dict[str, Any](
 
 
 def main() -> None:
+    env_name = "breakout"
     env: VectorEnv[npt.NDArray[np.uint8], npt.NDArray[np.uint64], npt.NDArray[Any]] = (
         gym.make_vec("ALE/Breakout-v5", num_envs=btr.NUM_ENVS, **ALE_PROTOCOL)
     )
@@ -47,6 +52,7 @@ def main() -> None:
     obs_stack: int = env.single_observation_space.shape[0]
     qnet = btr.QNet(num_actions, obs_stack=obs_stack, rngs=rngs)
     target_qnet = nnx.clone(qnet)
+    inference_qnet = nnx.clone(qnet)
 
     opt = nnx.Optimizer(
         qnet,
@@ -69,6 +75,12 @@ def main() -> None:
         seed=SEED,
     )
 
+    now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    checkpoint_path = Path(f"./checkpoints/{env_name}_{now_str}_qnet").absolute()
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    writer = SummaryWriter(f"./logs/{env_name}_{now_str}")
+
     obs, _info = env.reset()
     buf.reset(obs)
 
@@ -87,17 +99,35 @@ def main() -> None:
 
     # General:
     # TODO: Every once in a while run an evaluation run to display progress
-    # TODO: `env.num_envs * step` counts env steps, not stored transitions -- under
-    #       next-step autoreset the post-termination step stores nothing. Print len(buf).
+
+    avg_returns = 0
+    curr_returns = 0
     for step in count():
-        if not step % 100:
-            print(f"Num transitions: {env.num_envs * step}")
+        should_train = btr.TRAIN_START_BUF_SIZE < len(buf)
+
+        # TODO: replace this garbage with real tracking
+        if step % 25 == 0:
+            num_env_steps = env.num_envs * step
+            print(f"Num environment steps: {num_env_steps}")
+            print(f"Average returns: {avg_returns}")
+            if should_train:
+                writer.add_scalar(
+                    "avg_training_returns", avg_returns, global_step=num_env_steps
+                )
+
         next_obs, rewards, terminated, truncated, _info = env.step(actions)
 
-        next_actions = btr.act(qnet, next_obs, rngs=rngs)
+        curr_returns += rewards[0]
+        if terminated[0] or truncated[0]:
+            factor = 0.99
+            avg_returns = factor * avg_returns + (1 - factor) * curr_returns
+            curr_returns = 0
+
+        next_actions = btr.act(inference_qnet, next_obs, rngs=rngs)
         next_actions.copy_to_host_async()
 
-        should_train = btr.TRAIN_START_BUF_SIZE < len(buf)
+        if step % btr.INFERENCE_SYNC_FREQ == 0:
+            btr.sync_qnet(qnet, inference_qnet)
 
         if should_train:
             (
@@ -135,7 +165,10 @@ def main() -> None:
         # TODO: the target update is keyed on the env-loop counter, which only equals the
         #       gradient-step count while the act/train ratio stays 1:1. Count updates instead.
         if should_train and step % btr.TARGET_NETWORK_UPDATE_FREQ == 0:
-            btr.update_target(qnet, target_qnet)
+            btr.sync_qnet(qnet, target_qnet)
+
+            # TODO: check if this is correct, improve per run naming, throw this into a dedicated directory, etc.
+            ocp.save_async(checkpoint_path, nnx.state(qnet), overwrite=True)
 
         obs = next_obs
         actions = jax.device_get(next_actions)

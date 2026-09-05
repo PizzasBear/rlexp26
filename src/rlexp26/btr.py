@@ -33,6 +33,7 @@ IQN_NUM_COS = 64
 IQN_HUBER_LOSS_K = 1.0
 GRADIENT_CLIPPING_MAX_NORM = 10
 
+INFERENCE_SYNC_FREQ = 3
 TARGET_NETWORK_UPDATE_FREQ = 500
 IMPALA_SIZE_FACTOR = 2
 
@@ -62,7 +63,7 @@ MUNCHAUSEN_CLIPPING_VAL = -1.0
 # === Correctness to settle ===
 # TODO: decide the Munchausen n-step scale: add MUNCHAUSEN_N_STEP_SCALE, ablate
 #       1.0 vs (γ^n-1)/(γ-1). Clip before scaling.
-# TODO: NoisyLinear draws independent noise per batch element AND per quantile sample
+# TODO: NoisyLinear used to draw independent noise per batch element AND per quantile sample
 #       (eps shapes are [B, K, features]). The original draws one factorised pair per
 #       forward pass, shared across the batch. Decide which, and ablate.
 # TODO: act() is effectively argmax already (q/τ has spread ~1e4). Switch to argmax
@@ -74,14 +75,13 @@ MUNCHAUSEN_CLIPPING_VAL = -1.0
 #       the loss is a *sum* over IQN_TRAIN_SAMPLES quantiles -- so changing K rescales
 #       every priority.
 # TODO: PER_BETA is pinned at 1.0. Standard PER anneals 0.4 -> 1.0 over training; decide
-#       whether to anneal and where the schedule lives.
+#       whether to anneal and where the schedule lives. Check how BTR does it.
 # TODO: n_steps and discount are passed to buf.sample() in __init__.main but defaulted in
 #       train_step(). They must agree; thread one value through instead of two defaults.
 
 # === Missing core pieces ===
 # TODO: real train step, decoupled from the env loop (warmup already exists via
 #       TRAIN_START_BUF_SIZE).
-# TODO: separate inference net for act(), synced from the training net.
 # TODO: evaluation loop with unclipped rewards and no sticky-action mismatch.
 # TODO: logging (TensorBoard or wandb): return, loss, Q magnitude, TD error,
 #       grad norm, σ per SN layer, NoisyNet σ, dead-unit fraction, fps.
@@ -222,8 +222,8 @@ class NoisyLinear(nnx.Module):
                 "rngs argument is required unless deterministic behaviour is specified"
             )
 
-        eps_in = self._f(rngs.noise.normal((*inputs.shape[:-1], self.in_features)))
-        eps_out = self._f(rngs.noise.normal((*inputs.shape[:-1], self.out_features)))
+        eps_in = self._f(rngs.noise.normal((self.in_features,)))
+        eps_out = self._f(rngs.noise.normal((self.out_features,)))
 
         noise = eps_out * ((eps_in * inputs) @ self.kernel_sigma + self.bias_sigma)
 
@@ -503,12 +503,17 @@ def train_step(
     )
     opt.update(qnet, grads)
 
-    # TODO: see the priority-definition entry at the top -- loss vs |TD error|, and the
-    #       non-standard epsilon placement.
-    return PER_EPSILON + transition_losses**PER_ALPHA
+    # TODO: see the priority-definition entry at the top -- loss vs |TD error|
+    return (transition_losses / num_samples + PER_EPSILON) ** PER_ALPHA
 
 
 # Once every TARGET_NETWORK_UPDATE_FREQ steps
 @nnx.jit
-def update_target(qnet: QNet, target_qnet: QNet):
+def sync_qnet(qnet: QNet, target_qnet: QNet):
+    # TODO: Make sure this works how I expect it to with JIT and doesn't recompile on every run.
+
+    # Copy parameters
     nnx.update(target_qnet, nnx.state(qnet))
+
+    # Disable update_stats on SpectralNorm layers
+    target_qnet.set_attributes(use_running_average=True, raise_if_not_found=False)

@@ -13,3 +13,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Artifcats
+checkpoints
+logs
