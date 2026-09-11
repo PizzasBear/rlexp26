@@ -178,11 +178,11 @@ def adaptive_max_pool(x: jax.Array, output_size: Collection[int]) -> jax.Array:
         window_shape.append(k)
         padding.append(((p + 1) // 2, p // 2))
 
-    return nnx.max_pool(  # type: ignore
+    return nnx.max_pool(  # type: ignore[no-untyped-call, no-any-return]
         x,
         window_shape=tuple(window_shape),
         strides=tuple(strides),
-        padding=padding,  # type: ignore
+        padding=padding,  # pyright: ignore
     )
 
 
@@ -229,7 +229,7 @@ class NoisyLinear(nnx.Module):
     ) -> jax.Array:
         inputs = jnp.asarray(inputs)
 
-        y = inputs @ self.kernel_mean[...] + self.bias_mean
+        y: jax.Array = inputs @ self.kernel_mean[...] + self.bias_mean
         if deterministic if deterministic is not None else self.deterministic:
             return y
 
@@ -289,7 +289,7 @@ class ImpalaBlock(nnx.Module):
     def __call__(self, x: ArrayLike) -> jax.Array:
         x = jnp.asarray(x)
         x = self.conv0(x)
-        x = nnx.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding="SAME")
+        x = nnx.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding="SAME")  # type: ignore[no-untyped-call]
         x = self.res1(x)
         x = self.res2(x)
         return x
@@ -321,7 +321,7 @@ class ImpalaCNNLarge(nnx.Module):
         # Impala ends its trunk on a ReLU. Order against the pool is irrelevant:
         # relu is monotonic, so max(relu(x)) == relu(max(x)).
         x = nnx.relu(x)
-        x = adaptive_max_pool(cast(jax.Array, x), (6, 6))
+        x = adaptive_max_pool(x, (6, 6))
         return x.reshape(*x.shape[:-3], -1)
 
 
@@ -425,7 +425,7 @@ def act(
     #       this to argmax instead.
     q = qnet.random_n_samples_mean(obs, num_samples, rngs=rngs)
     logits = nnx.log_softmax(q / temperature)
-    return rngs.actions.categorical(logits)
+    return cast(jax.Array, rngs.actions.categorical(logits))
 
 
 @nnx.jit(static_argnames=("num_samples", "n_steps"))
@@ -433,7 +433,7 @@ def train_step(
     *,
     qnet: QNet,
     target_qnet: QNet,
-    opt: nnx.Optimizer,
+    opt: nnx.Optimizer[QNet],
     sample_prios: ArrayLike,
     obs: ArrayLike,
     actions: ArrayLike,
@@ -444,7 +444,7 @@ def train_step(
     discount: float = DISCOUNT,
     n_steps: int = N_STEP,
     num_samples: int = IQN_TRAIN_SAMPLES,
-    huber_k=IQN_HUBER_LOSS_K,
+    huber_k: float = IQN_HUBER_LOSS_K,
     temperature: float = MUNCHAUSEN_TEMPERATURE,
     munchausen_scaling_term: float = MUNCHAUSEN_SCALING_TERM,
     munchausen_clipping_val: float = MUNCHAUSEN_CLIPPING_VAL,
@@ -462,7 +462,9 @@ def train_step(
     importance_sampling_weights = jnp.asarray(sample_prios) ** -PER_BETA
     importance_sampling_weights /= jnp.max(importance_sampling_weights)
 
-    def loss_fn(qnet: QNet, target_qnet: QNet, rngs: nnx.Rngs):
+    def loss_fn(
+        qnet: QNet, target_qnet: QNet, rngs: nnx.Rngs
+    ) -> tuple[jax.Array, jax.Array]:
         target_qnet_qs = target_qnet.random_n_samples_mean(obs, num_samples, rngs=rngs)
         target_logits = nnx.log_softmax(target_qnet_qs / temperature)
         target_action_log_probs = jnp.take_along_axis(target_logits, actions, -1)
@@ -525,7 +527,7 @@ def train_step(
 
 # Once every TARGET_NETWORK_UPDATE_FREQ steps
 @nnx.jit
-def sync_qnet(qnet: QNet, target_qnet: QNet):
+def sync_qnet(qnet: QNet, target_qnet: QNet) -> None:
     # set_attributes below flips a static attribute, so this compiles once for the
     # use_running_average=False graphdef (the first call after nnx.clone) and once for the
     # True one, then hits cache. Verified; not a per-call retrace.

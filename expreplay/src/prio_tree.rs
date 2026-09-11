@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{AllocationError, try_zeroed_vec};
+use crate::utils::{AllocationError, try_zeroed_vec};
 
 #[derive(Debug, Error)]
 pub enum UpdateError {

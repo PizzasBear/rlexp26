@@ -22,6 +22,7 @@ dependencies = [
 
 [project.scripts]
 rlexp26 = "rlexp26:main"
+rlexp26-eval = "rlexp26:evaluate"
 
 [project.optional-dependencies]
 cuda13 = ["jax[cuda13]"]
@@ -41,16 +42,26 @@ requires = ["uv_build>=0.12.3,<0.13.0"]
 build-backend = "uv_build"
 
 [tool.mypy]
+strict = true
 
-# optax ships no py.typed; the note otherwise buries real errors.
+# These ship no py.typed; the notes otherwise bury real errors.
 [[tool.mypy.overrides]]
-module = ["optax.*"]
+module = ["optax.*", "etils.*", "orbax.*", "tensorboardX"]
 ignore_missing_imports = true
+
+# Vendored Flax primitives -- kept diffable against upstream, so not annotated.
+[[tool.mypy.overrides]]
+module = ["rlexp26.internals"]
+ignore_errors = true
 
 [tool.pyright]
 venv = ".venv"
 venvPath = "."
 typeCheckingMode = "basic"
+# Vendored Flax primitives -- kept diffable against upstream, so not annotated.
+# Both reports are upstream's own: scale_init(rngs["params"], ...) and the
+# unnarrowed Optional[dict] scales.
+ignore = ["src/rlexp26/internals.py"]
 
 [tool.ruff.lint.per-file-ignores]
 # Vendored Flax primitives -- kept diffable against upstream, so not restyled.

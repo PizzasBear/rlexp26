@@ -1,4 +1,5 @@
-from datetime import datetime
+import datetime as dt
+from argparse import ArgumentParser
 from itertools import count
 from typing import Any
 
@@ -10,7 +11,7 @@ import numpy.typing as npt
 import optax
 from etils.epath import Path
 from flax import nnx
-from gymnasium.spaces import Box, MultiDiscrete
+from gymnasium.spaces import Box, Discrete, MultiDiscrete
 from gymnasium.vector import VectorEnv
 from orbax.checkpoint import v1 as ocp
 from tensorboardX import SummaryWriter
@@ -22,6 +23,7 @@ from expreplay import ReplayBuffer
 from . import btr
 
 SEED = 0
+FIRE_ACTION = 1  # ALE action 1 launches the ball in Breakout
 ALE_PROTOCOL = dict[str, Any](
     repeat_action_probability=0.25,  # sticky actions (Machado et al. 2018)
     frameskip=4,
@@ -33,6 +35,86 @@ ALE_PROTOCOL = dict[str, Any](
     img_height=84,
     img_width=84,
 )
+
+
+def evaluate() -> None:
+    parser = ArgumentParser()
+    parser.add_argument("checkpoint_path", type=Path)
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=None,
+        help="stop after this many episodes; runs until interrupted by default",
+    )
+    args = parser.parse_args()
+
+    checkpoint_path: Path = args.checkpoint_path
+    episodes: int | None = args.episodes
+
+    # Rebuilds ALE_PROTOCOL out of wrappers, since the native vectoriser that applies it in
+    # main() cannot render. Two deliberate departures from the protocol: rewards stay unclipped,
+    # because eval reports the game score, and sticky actions are off, because deterministic
+    # transitions are easier to watch. Both mean these numbers are NOT comparable with the
+    # training curve or with Machado-protocol published scores.
+    env: gym.Env[npt.NDArray[np.uint8], np.int64] = gym.make(
+        "ALE/Breakout-v5",
+        repeat_action_probability=0,  # deliberate, see above
+        frameskip=1,  # AtariPreprocessing does the skipping and the maxpool
+        render_mode="human",
+    )
+    env = gym.wrappers.AtariPreprocessing(
+        env,
+        frame_skip=ALE_PROTOCOL["frameskip"],
+        noop_max=ALE_PROTOCOL["noop_max"],
+        screen_size=(ALE_PROTOCOL["img_width"], ALE_PROTOCOL["img_height"]),
+    )
+    env = gym.wrappers.FrameStackObservation(env, ALE_PROTOCOL["stack_num"])
+
+    assert isinstance(env.action_space, Discrete)
+    assert isinstance(env.observation_space, Box)
+
+    num_actions: int = int(env.action_space.n)
+
+    rngs = nnx.Rngs(SEED)
+    obs_stack: int = env.observation_space.shape[0]
+    qnet = btr.QNet(num_actions, obs_stack=obs_stack, rngs=rngs)
+    # The abstract state matters: SpectralNorm keys its batch_stats by tuple, and a
+    # structure-free load hands those back stringified, which corrupts the graph.
+    nnx.update(qnet, ocp.load(checkpoint_path.absolute(), nnx.state(qnet)))
+    qnet.eval()  # type: ignore[no-untyped-call]
+
+    # Unlike main()'s vectoriser, a single env does not autoreset: it keeps reporting terminated
+    # until reset() is called, so every episode here starts with an explicit pair of calls. The
+    # reset observation is the one before the ball is launched, so it is the FIRE step's
+    # observation that the policy is given, not reset()'s.
+    def start_episode() -> npt.NDArray[np.uint8]:
+        env.reset()
+        # ALE_PROTOCOL trains with use_fire_reset=True, which fires on reset and not on a lost
+        # life, so the policy has to relaunch the ball itself mid-episode. Match that here.
+        obs, _reward, terminated, truncated, _info = env.step(FIRE_ACTION)
+        assert not (terminated or truncated), "the episode ended on its opening FIRE"
+        return obs
+
+    obs = start_episode()
+    returns, played = 0.0, 0
+    try:
+        while episodes is None or played < episodes:
+            action = jax.device_get(btr.act(qnet, obs, rngs=rngs))
+
+            next_obs, reward, terminated, truncated, _info = env.step(action)
+
+            returns += float(reward)
+            if terminated or truncated:
+                print("EPISODE " + ("TRUNCATED" if truncated else "TERMINATED"))
+                print(f"  TOTAL REWARDS = {returns}")
+                returns, played = 0.0, played + 1
+                obs = start_episode()
+            else:
+                obs = next_obs
+    except KeyboardInterrupt:
+        print(f"\nINTERRUPTED after {played} episodes")
+    finally:
+        env.close()
 
 
 def main() -> None:
@@ -75,7 +157,7 @@ def main() -> None:
         seed=SEED,
     )
 
-    now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    now_str = dt.datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
     checkpoint_path = Path(f"./checkpoints/{env_name}_{now_str}_qnet").absolute()
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 

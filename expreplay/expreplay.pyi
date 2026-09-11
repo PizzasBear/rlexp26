@@ -63,7 +63,11 @@ class ReplayBuffer:
         Allocate a buffer holding ``num_envs * env_capacity`` transitions.
 
         ``obs_shape`` and ``act_shape`` describe a single observation and action; the environment
-        and slot axes are prepended internally. Only ``float32`` and ``uint8`` are supported.
+        and slot axes are prepended internally. Either dtype may be any of ``uint8``, ``uint16``,
+        ``uint32``, ``uint64``, ``int8``, ``int16``, ``int32``, ``int64``, ``float16``,
+        ``float32`` or ``float64``; anything else raises ``TypeError``. Note that ``float16`` is
+        the one dtype with no element-by-element fallback on the way in -- :meth:`reset` and
+        :meth:`save_step` take a real ``numpy`` array of it and nothing else.
 
         ``obs_stack`` makes :meth:`sample` return that many consecutive frames per observation
         and lets :meth:`save_step` accept an environment's stacked observation directly. Only one frame
@@ -74,6 +78,12 @@ class ReplayBuffer:
         marginal is unchanged, only the draws' correlation. It defaults to ``use_prios`` and
         requires it: passing it without priorities raises ``ValueError``, since a uniform draw is
         already spread over every samplable transition and there is no mass to slice.
+
+        A slice holding nothing samplable is drawn from the whole mass instead, rather than
+        failing the call. That happens when ``sum_prios / batch_size`` falls below the priority
+        on the handful of too-recent transitions behind a write head -- a small buffer, a batch
+        comparable to the number of stored transitions, or a ``max_prio`` far above the rest of
+        the distribution -- and costs only the draws it applies to their stratification.
 
         ``use_prios`` enables prioritised sampling; see :meth:`update_prios` for
         ``max_prio_decay``. n-step returns are asked for per draw rather than here -- see

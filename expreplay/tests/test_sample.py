@@ -16,10 +16,8 @@ def build(**kwargs) -> ReplayBuffer:
         NUM_ENVS,
         CAPACITY,
         obs_shape=OBS_SHAPE,
-        obs_dtype=np.uint8,
-        act_dtype=np.uint8,
         seed=0,
-        **kwargs,
+        **{"obs_dtype": np.uint8, "act_dtype": np.uint8, **kwargs},
     )
 
 
@@ -51,6 +49,113 @@ def play(rb: ReplayBuffer, steps: int, *, terminate_at: frozenset[int] = frozens
             frame(nxt),
         )
         value, ended = nxt, terminated
+
+
+# Every dtype the buffer stores, in the order `dyn_array.rs` lists them. These only reach
+# Python -- `cargo test` builds no interpreter, so the boundary that converts them is the one
+# thing the Rust tests cannot touch.
+DTYPES = [
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.float16,
+    np.float32,
+    np.float64,
+]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_every_supported_dtype_survives_the_round_trip(dtype) -> None:
+    """Store it, draw it back, and check the value made it through unchanged."""
+    rb = ReplayBuffer(
+        NUM_ENVS,
+        CAPACITY,
+        obs_shape=(1,),
+        obs_dtype=dtype,
+        act_shape=(),
+        act_dtype=dtype,
+        obs_stack=STACK,
+        seed=0,
+    )
+    assert rb.obs_dtype == np.dtype(dtype) and rb.act_dtype == np.dtype(dtype)
+
+    rb.reset(np.zeros((NUM_ENVS, STACK, 1), dtype))
+    for step in range(1, 40):
+        rb.save_step(
+            np.full(NUM_ENVS, step, dtype),
+            np.full(NUM_ENVS, float(step), np.float32),
+            np.zeros(NUM_ENVS, bool),
+            np.zeros(NUM_ENVS, bool),
+            np.full((NUM_ENVS, STACK, 1), step, dtype),
+        )
+
+    _i, _p, obs, act, _r, _t, next_obs = rb.sample(64)
+    assert obs.dtype == np.dtype(dtype) and next_obs.dtype == np.dtype(dtype)
+    assert act.dtype == np.dtype(dtype)
+
+    # `play` above stores the step counter in both. The action recorded with a transition is
+    # the one taken *from* its observation, so it is the counter of the frame after it.
+    newest = obs[:, -1, 0].astype(np.int64)
+    assert (act.astype(np.int64) == newest + 1).all()
+    assert (next_obs[:, -1, 0].astype(np.int64) == newest + 1).all()
+
+
+def test_an_unsupported_dtype_names_the_ones_that_would_have_worked() -> None:
+    for bad in (np.complex64, np.bool_, "U4"):
+        with pytest.raises(TypeError, match="Unsupported dtype"):
+            build(obs_dtype=bad)
+
+    # The message is built from the same list the buffer dispatches on, so it stays true.
+    with pytest.raises(TypeError, match="uint8, uint16, .*float32, float64"):
+        build(obs_dtype=np.complex64)
+
+
+def test_a_mismatched_dtype_says_which_argument_and_what_it_wanted() -> None:
+    """Nothing is cast on the way in, and the refusal has to be readable."""
+    rb = ReplayBuffer(
+        NUM_ENVS, CAPACITY, obs_shape=OBS_SHAPE, obs_dtype=np.uint8, act_dtype=np.int32
+    )
+
+    with pytest.raises(TypeError, match="obs must be a uint8 array, got a float32"):
+        rb.reset(frame(0).astype(np.float32))
+
+    rb.reset(frame(0))
+    with pytest.raises(TypeError, match="actions must be a int32 array, got a uint8"):
+        rb.save_step(
+            np.zeros(NUM_ENVS, np.uint8),
+            np.zeros(NUM_ENVS, np.float32),
+            np.zeros(NUM_ENVS, bool),
+            np.zeros(NUM_ENVS, bool),
+            frame(1),
+        )
+    with pytest.raises(TypeError, match="next_obs must be a uint8 array, got a list"):
+        rb.save_step(
+            np.zeros(NUM_ENVS, np.int32),
+            np.zeros(NUM_ENVS, np.float32),
+            np.zeros(NUM_ENVS, bool),
+            np.zeros(NUM_ENVS, bool),
+            frame(1).tolist(),
+        )
+
+
+def test_float16_takes_a_real_array_and_nothing_else() -> None:
+    """The one dtype with no element-by-element fallback: pyo3 cannot build an f16 from a float."""
+    rb = ReplayBuffer(
+        NUM_ENVS, CAPACITY, obs_shape=(2,), obs_dtype=np.float16, act_dtype=np.uint8
+    )
+    rb.reset(np.zeros((NUM_ENVS, 2), np.float16))
+
+    with pytest.raises(TypeError, match="obs must be a float16 array, got a list"):
+        rb.reset([[0.0, 0.0]] * NUM_ENVS)
+
+    # Not a cast either -- a float32 array is refused the same way every other dtype is.
+    with pytest.raises(TypeError, match="obs must be a float16 array"):
+        rb.reset(np.zeros((NUM_ENVS, 2), np.float32))
 
 
 def test_sample_shapes_and_dtypes() -> None:
