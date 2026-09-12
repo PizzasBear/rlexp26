@@ -1,5 +1,7 @@
 """End-to-end checks that need the built extension."""
 
+from typing import Any
+
 import numpy as np
 import pytest
 
@@ -11,7 +13,7 @@ OBS_SHAPE = (4, 4)
 STACK = 4
 
 
-def build(**kwargs) -> ReplayBuffer:
+def build(**kwargs: Any) -> ReplayBuffer:
     return ReplayBuffer(
         NUM_ENVS,
         CAPACITY,
@@ -28,10 +30,14 @@ def frame(value: int) -> np.ndarray:
 
 def stacked(value: int) -> np.ndarray:
     """The environment's view: `(num_envs, STACK, *OBS_SHAPE)`, newest last."""
-    return np.stack([frame(max(0, value - STACK + 1 + i)) for i in range(STACK)], axis=1)
+    return np.stack(
+        [frame(max(0, value - STACK + 1 + i)) for i in range(STACK)], axis=1
+    )
 
 
-def play(rb: ReplayBuffer, steps: int, *, terminate_at: frozenset[int] = frozenset()) -> None:
+def play(
+    rb: ReplayBuffer, steps: int, *, terminate_at: frozenset[int] = frozenset()
+) -> None:
     """Step the buffer, filling each frame with a counter and each reward with the same number.
 
     The counter jumps at an episode boundary rather than carrying straight on, so that a frame
@@ -54,7 +60,7 @@ def play(rb: ReplayBuffer, steps: int, *, terminate_at: frozenset[int] = frozens
 # Every dtype the buffer stores, in the order `dyn_array.rs` lists them. These only reach
 # Python -- `cargo test` builds no interpreter, so the boundary that converts them is the one
 # thing the Rust tests cannot touch.
-DTYPES = [
+DTYPES: list[type[np.generic]] = [
     np.uint8,
     np.uint16,
     np.uint32,
@@ -70,7 +76,7 @@ DTYPES = [
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_every_supported_dtype_survives_the_round_trip(dtype) -> None:
+def test_every_supported_dtype_survives_the_round_trip(dtype: type[np.generic]) -> None:
     """Store it, draw it back, and check the value made it through unchanged."""
     rb = ReplayBuffer(
         NUM_ENVS,
@@ -150,8 +156,9 @@ def test_float16_takes_a_real_array_and_nothing_else() -> None:
     )
     rb.reset(np.zeros((NUM_ENVS, 2), np.float16))
 
+    not_an_array = [[0.0, 0.0]] * NUM_ENVS  # the refusal below is the point of the test
     with pytest.raises(TypeError, match="obs must be a float16 array, got a list"):
-        rb.reset([[0.0, 0.0]] * NUM_ENVS)
+        rb.reset(not_an_array)  # type: ignore[arg-type]
 
     # Not a cast either -- a float32 array is refused the same way every other dtype is.
     with pytest.raises(TypeError, match="obs must be a float16 array"):
@@ -185,7 +192,9 @@ def test_sample_returns_consecutive_frames_and_the_right_successor() -> None:
     # integers ending on the newest.
     newest = obs[:, -1].reshape(64, -1)[:, 0].astype(int)
     for offset in range(STACK):
-        assert (obs[:, STACK - 1 - offset].reshape(64, -1)[:, 0] == newest - offset).all()
+        assert (
+            obs[:, STACK - 1 - offset].reshape(64, -1)[:, 0] == newest - offset
+        ).all()
 
     # One-step returns: the reward stored with a transition is its own step number, and its
     # successor observation is the frame after it.
@@ -237,7 +246,9 @@ def test_n_step_returns_and_terminals() -> None:
     rb.reset(frame(0))
     play(rb, 40, terminate_at=frozenset({20}))
 
-    _i, _prios, obs, _a, rewards, terminals, _n = rb.sample(256, n_steps=3, discount=0.5)
+    _i, _prios, obs, _a, rewards, terminals, _n = rb.sample(
+        256, n_steps=3, discount=0.5
+    )
 
     # `play` sets each reward to the same counter as the frame, so a full three-step return from
     # a transition whose newest frame is `v` is `v + (v+1)/2 + (v+2)/4`. Rollouts a terminal cut
@@ -318,13 +329,17 @@ def test_sample_after_the_buffer_wraps() -> None:
     play(rb, 150, terminate_at=frozenset({37}))
     assert len(rb) == rb.total_capacity, "150 steps should have wrapped 64 slots"
 
-    _i, prios, obs, _a, rewards, terminals, next_obs = rb.sample(1024, n_steps=3, discount=0.5)
+    _i, prios, obs, _a, rewards, terminals, next_obs = rb.sample(
+        1024, n_steps=3, discount=0.5
+    )
 
     # Both stacks stay well formed, and `next_obs` is the full three steps ahead: a wrapped age
     # that ran onto the head would show up as a stack out of order or a successor out of place.
     newest = obs[:, -1].reshape(1024, -1)[:, 0].astype(int)
     assert (next_obs[:, -1].reshape(1024, -1)[:, 0] == newest + 3).all()
-    assert not terminals.any(), "the one terminal is 113 steps back, so it has been overwritten"
+    assert not terminals.any(), (
+        "the one terminal is 113 steps back, so it has been overwritten"
+    )
 
     start = newest.astype(np.float32)
     assert np.allclose(rewards, start + (start + 1) / 2 + (start + 2) / 4)
@@ -341,7 +356,10 @@ def test_sample_survives_priorities_that_have_collapsed_to_nothing() -> None:
 
     indices, *_ = rb.sample(32)
     tiny = np.float32(np.finfo(np.float32).smallest_subnormal)
-    rb.update_prios(np.arange(rb.total_capacity, dtype=np.uint32), np.zeros(rb.total_capacity, np.float32))
+    rb.update_prios(
+        np.arange(rb.total_capacity, dtype=np.uint32),
+        np.zeros(rb.total_capacity, np.float32),
+    )
     rb.update_prios(indices[:1], np.full(1, tiny, dtype=np.float32))
 
     drawn, prios, *_ = rb.sample(32)

@@ -11,5 +11,12 @@ dynamic = ["version"]
 requires = ["maturin>=1.15,<2.0"]
 build-backend = "maturin"
 
+[tool.mypy]
+strict = true
+# `-p expreplay` reaches only the stub; the tests are the sole caller of the boundary, so name
+# both here and check them with a bare `uv run mypy` run from this directory -- the root
+# config names no files, so the same command there reports only that it has no target.
+files = ["expreplay.pyi", "tests"]
+
 [tool.uv]
 cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "**/*.rs" }, { file = "**/*.pyi" }]

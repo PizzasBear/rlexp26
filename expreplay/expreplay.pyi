@@ -55,6 +55,7 @@ class ReplayBuffer:
         act_dtype: npt.DTypeLike = np.uint8,
         obs_stack: int | None = None,
         use_prios: bool = False,
+        max_prio: float = 1.0,
         max_prio_decay: float = 0.999,
         stratified: bool | None = None,
         seed: int | None = None,
@@ -86,8 +87,11 @@ class ReplayBuffer:
         the distribution -- and costs only the draws it applies to their stratification.
 
         ``use_prios`` enables prioritised sampling; see :meth:`update_prios` for
-        ``max_prio_decay``. n-step returns are asked for per draw rather than here -- see
-        :meth:`sample`.
+        ``max_prio_decay``. ``max_prio`` seeds the priority new transitions are given, so that a
+        run resuming from a checkpoint does not refill its buffer at the scale of a fresh one; it
+        is held to the same rule a priority is in :meth:`update_prios`, finite and non-negative,
+        and is read-only once the buffer exists. n-step returns are asked for per draw rather than
+        here -- see :meth:`sample`.
 
         ``env_capacity`` must be at least three: the write head and the slot holding its
         ``next_obs`` are always spoken for, so anything smaller cannot hold a samplable transition.
@@ -145,6 +149,10 @@ class ReplayBuffer:
         This is the scale :meth:`sample` reports its priorities against, so an
         importance-sampling correction normalised against the whole buffer rather than against
         the batch that came back reads its denominator from here.
+
+        Its starting value is a constructor argument; unlike :attr:`max_prio_decay` it is not
+        settable, since every priority already stored was written against whatever value was in
+        force at the time.
         """
 
     @property

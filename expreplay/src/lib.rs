@@ -183,6 +183,7 @@ pub struct ReplayBufferSpec<'a> {
     act_dtype: DType,
     obs_stack: Option<NonZero<u32>>,
     use_prios: bool,
+    max_prio: f32,
     max_prio_decay: f32,
     stratified: Option<bool>,
     seed: Option<u64>,
@@ -202,6 +203,7 @@ impl<'a> ReplayBufferSpec<'a> {
             act_dtype,
             obs_stack: None,
             use_prios: false,
+            max_prio: 1.0,
             max_prio_decay: 0.999,
             stratified: None,
             seed: None,
@@ -215,6 +217,11 @@ impl<'a> ReplayBufferSpec<'a> {
 
     pub fn with_use_prios(mut self, use_prios: bool) -> Self {
         self.use_prios = use_prios;
+        self
+    }
+
+    pub fn with_max_prio(mut self, max_prio: f32) -> Self {
+        self.max_prio = max_prio;
         self
     }
 
@@ -484,6 +491,17 @@ impl ReplayBuffer {
             ));
         }
 
+        // The starting `max_prio` is held to the rule a priority is held to in `update_prios`,
+        // since it is the same quantity, seeded rather than computed. Zero is therefore allowed,
+        // and means new transitions stay unsamplable until something writes a priority. Unlike
+        // `max_prio_decay` there is no setter to keep in agreement, so this is checked inline.
+        if !spec.max_prio.is_finite() || spec.max_prio < 0.0 {
+            return Err(ReplayBufferError::invalid_argument(format!(
+                "max_prio {} must be finite and non-negative",
+                spec.max_prio
+            )));
+        }
+
         check_max_prio_decay(spec.max_prio_decay)?;
 
         // Stratification slices the *priority* mass, so without priorities there is nothing for
@@ -534,7 +552,7 @@ impl ReplayBuffer {
             types: Array2::from_shape_vec(table_shape, try_zeroed_vec(len as _)?)
                 .expect("shape is `len` elements"),
 
-            max_prio: 1.0,
+            max_prio: spec.max_prio,
             max_prio_decay: spec.max_prio_decay,
             prios: if spec.use_prios {
                 Some(PrioTree::new(len as _)?)
@@ -621,6 +639,13 @@ impl ReplayBuffer {
     /// This is the scale [`sample`](Self::sample)'s priorities are drawn against, so an
     /// importance-sampling correction that normalises against the whole buffer rather than the
     /// batch reads it from here.
+    ///
+    /// Its starting value is a [`ReplayBufferSpec`] field -- a run resuming from a checkpoint
+    /// carries it across, so that the transitions its refilled buffer writes are not all handed
+    /// the priority of a fresh one -- but there is no setter, unlike
+    /// [`max_prio_decay`](Self::max_prio_decay). Every priority already written was written
+    /// against some value of this one, and moving it mid-run silently reweights new transitions
+    /// against transitions that were new under the old scale.
     pub fn max_prio(&self) -> f32 {
         self.max_prio
     }
@@ -999,29 +1024,25 @@ impl ReplayBuffer {
         }
         obs_shape.extend_from_slice(&self.observations.shape()[2..]);
 
-        let obs = &self.observations;
-
-        // The draw already came back a column at a time, so every one of these is a move: the
-        // indices double as the action gather's slots, and `Array1::from_vec` only takes ownership
-        // of a buffer that is already the right length.
-        let actions = dyn_gather(&self.actions, &batch.indices, capacity);
-
+        // Field order here is the borrow checker's, not `Batch`'s: the action gather borrows
+        // `batch.indices` and `Array1::from_vec` moves it, so every gather has to be written
+        // before the two `from_vec`s that consume their columns.
         Ok(Batch {
-            indices: Array1::from_vec(batch.indices),
-            prios: Array1::from_vec(batch.prios),
             // `dyn_gather` returns one row per slot, so a stacked draw arrives with its frames
             // folded into the batch axis; `obs_shape` unfolds them. The count is the same either
             // way -- `obs_slots` holds `batch_size * obs_stack` entries -- so the reshape cannot
             // fail, and it is free on a freshly allocated contiguous array.
-            obs: dyn_gather(obs, &batch.obs_slots, capacity)
+            obs: dyn_gather(&self.observations, &batch.obs_slots, capacity)
                 .into_shape_with_order(obs_shape.clone())
                 .expect("the gather returned one row per stacked frame"),
-            actions,
+            actions: dyn_gather(&self.actions, &batch.indices, capacity),
             rewards: Array1::from_vec(batch.returns),
             terminals: Array1::from_vec(batch.terminals),
-            next_obs: dyn_gather(obs, &batch.next_obs_slots, capacity)
+            next_obs: dyn_gather(&self.observations, &batch.next_obs_slots, capacity)
                 .into_shape_with_order(obs_shape)
                 .expect("the gather returned one row per stacked frame"),
+            indices: Array1::from_vec(batch.indices),
+            prios: Array1::from_vec(batch.prios),
         })
     }
 
@@ -1541,5 +1562,55 @@ mod tests {
         // as if it were not.
         assert_eq!(rb.rollout(0, 1, 3, 0.5), None);
         assert_eq!(rb.rollout(0, 2, 2, 0.5), None);
+    }
+
+    #[test]
+    fn test_spec_max_prio_is_the_scale_new_transitions_are_written_at() {
+        // What a resumed run needs: its refilled buffer writes at the scale training had reached,
+        // not at a fresh buffer's 1.0.
+        let spec = spec()
+            .with_use_prios(true)
+            .with_max_prio(0.25)
+            .with_max_prio_decay(0.5);
+        let mut rb = ReplayBuffer::new(NonZero::new(1).unwrap(), 8, &spec).unwrap();
+        assert_eq!(rb.max_prio(), 0.25);
+
+        let obs = ArrayD::<u8>::zeros(IxDyn(&[1]));
+        let step = |rb: &mut ReplayBuffer| {
+            rb.save_step(
+                DynArrayView::U8(obs.view()),
+                &array![0.0],
+                &array![false],
+                &array![false],
+                DynArrayView::U8(obs.view()),
+            )
+            .unwrap()
+        };
+
+        // Slot 0 becomes a whole transition once slot 1 holds its `next_obs`, and is given
+        // `max_prio` as it does.
+        rb.reset(DynArrayView::U8(obs.view())).unwrap();
+        step(&mut rb);
+        step(&mut rb);
+        assert_eq!(rb.prios.as_ref().unwrap().prios()[0], 0.25);
+
+        // And the decay runs from there rather than from 1.0.
+        rb.update_prios(&array![0], &array![0.1]).unwrap();
+        assert_eq!(rb.max_prio(), 0.125);
+    }
+
+    #[test]
+    fn test_spec_max_prio_takes_what_a_priority_takes() {
+        let build = |max_prio| {
+            ReplayBuffer::new(NonZero::new(1).unwrap(), 8, &spec().with_max_prio(max_prio))
+        };
+
+        // Zero is reachable by decay, so it is reachable here: new transitions simply stay
+        // unsamplable until something writes a priority.
+        assert_eq!(build(0.0).unwrap().max_prio(), 0.0);
+
+        assert!(build(-1.0).is_err());
+        assert!(build(f32::NAN).is_err());
+        assert!(build(f32::INFINITY).is_err());
     }
 }

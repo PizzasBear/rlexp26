@@ -167,7 +167,9 @@ impl PyReplayBuffer {
     /// lets ``save_step`` accept a stacked observation directly; only one frame per slot is
     /// stored either way. ``use_prios`` enables prioritised sampling, and ``stratified``
     /// (defaulting to ``use_prios``, and requiring it) spreads a batch over the priority mass.
-    /// n-step returns are asked for per draw, in ``sample``, not here.
+    /// ``max_prio`` seeds the priority new transitions are given, for a run picking up where a
+    /// checkpointed one left off; it is read-only afterwards. n-step returns are asked for per
+    /// draw, in ``sample``, not here.
     ///
     /// Raises MemoryError if the buffer does not fit, OverflowError if its flat index would not
     /// fit in a uint32, and ValueError for out-of-range parameters.
@@ -178,7 +180,7 @@ impl PyReplayBuffer {
         obs_shape, obs_dtype = None,
         act_shape = vec![], act_dtype = None,
         obs_stack = None,
-        use_prios = false, max_prio_decay = None, stratified = None,
+        use_prios = false, max_prio = None, max_prio_decay = None, stratified = None,
         seed = None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -192,6 +194,7 @@ impl PyReplayBuffer {
         act_dtype: Option<&Bound<'py, PyAny>>,
         obs_stack: Option<NonZero<u32>>,
         use_prios: bool,
+        max_prio: Option<f32>,
         max_prio_decay: Option<f32>,
         stratified: Option<bool>,
         seed: Option<u64>,
@@ -203,13 +206,16 @@ impl PyReplayBuffer {
         let obs_dtype = obs_dtype.map_or(Ok(DType::F32), DType::from_np)?;
         let act_dtype = act_dtype.map_or(Ok(DType::U8), DType::from_np)?;
 
-        // `max_prio_decay` is left unset rather than defaulted here, so that the number itself
-        // lives in `ReplayBufferSpec::new` and nowhere else.
+        // `max_prio` and `max_prio_decay` are left unset rather than defaulted here, so that the
+        // numbers themselves live in `ReplayBufferSpec::new` and nowhere else.
         let mut spec = ReplayBufferSpec::new(&obs_shape, obs_dtype, &act_shape, act_dtype)
             .with_obs_stack(obs_stack)
             .with_use_prios(use_prios)
             .with_stratified(stratified)
             .with_seed(seed);
+        if let Some(max_prio) = max_prio {
+            spec = spec.with_max_prio(max_prio);
+        }
         if let Some(max_prio_decay) = max_prio_decay {
             spec = spec.with_max_prio_decay(max_prio_decay);
         }
@@ -293,6 +299,10 @@ impl PyReplayBuffer {
     ///
     /// This is the scale ``sample`` reports its priorities against, so an importance-sampling
     /// weight normalised against the whole buffer rather than one batch divides by this.
+    ///
+    /// Its starting value is a constructor argument, so that a resumed run does not hand its
+    /// refilled buffer the priorities of a fresh one, but it is not settable afterwards: every
+    /// priority already stored was written against the value in force at the time.
     #[getter]
     fn max_prio(&self) -> f32 {
         self.0.max_prio()
