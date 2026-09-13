@@ -1,3 +1,4 @@
+from collections import deque
 from collections.abc import Mapping
 from typing import Any, override
 
@@ -27,6 +28,7 @@ TRAIN_START_BUF_SIZE = 200_000
 PER_ALPHA = 0.2
 PER_BETA = 1.0  # BTR: 0.2
 PER_EPSILON = 1e-6
+PRIO_QUEUE_LEN = 3  # batches whose priorities may be in flight at once; see BTR.observe
 
 LEARNING_RATE = 1e-4
 ADAM_EPS = 0.005 / BATCH_SIZE
@@ -44,6 +46,16 @@ GRADIENT_CLIPPING_MAX_NORM = 10
 INFERENCE_SYNC_FREQ = 3
 TARGET_NETWORK_UPDATE_FREQ = 500
 IMPALA_SIZE_FACTOR = 2
+# The trunk's convolutions compute in this and nothing else does; ImpalaCNNLarge says what that
+# means for the parameters. Worth 1237 -> 2152 env steps/s, the largest single win the profiling
+# found, and the curves it was checked against are unmoved: spectral_sigma and weight_rms agree
+# with float32 to three digits over the first 12.5k gradient steps. float16 measures the same and
+# is not used, since the residual stream has no loss scaling behind it and bfloat16 is the one
+# that keeps float32's exponent range.
+# Spelled as a string so that ``hyperparameters`` below sweeps it up with the rest: a dtype
+# object is not one of the scalar types it keeps, and a run whose trunk precision were missing
+# from the HParams table could not be told from a float32 one afterwards.
+TRUNK_DTYPE = "bfloat16"  # BTR: float32
 
 MUNCHAUSEN_TEMPERATURE = 0.03
 MUNCHAUSEN_SCALING_TERM = 0.9
@@ -111,24 +123,58 @@ EVAL_EPS_GREEDY_OFF_FRAMES = 125_000_000
 #       and the buffer then holds nothing but data from a policy that is already trained.
 
 # === Performance ===
-# Measured 2026-09-06, 3080 + 24-thread host, 64 envs, batch 256, 1:1 act/train, steady state:
-# ~910 env steps/s (~3.6k ALE frames/s) => ~15h for 50M env steps / 200M frames.
-# GPU 80% util at 324W/370W and 84C; host CPU ~1.4 cores of 24. The GPU is the wall, and it is
-# already at its power/thermal limit, so wins have to come from doing less work on it.
-# Since that measurement act() stopped evaluating the value stream, so the numbers above are
-# stale on the act side and want re-taking. It still draws IQN_ACT_SAMPLES quantiles, which is
-# 32 rather than BTR's 8.
-# TODO: bf16 for the conv trunk, fp32 for the head and loss. The trunk is ~440 MFLOP/sample
-#       and runs three times per train step (online obs, target obs, target next_obs) plus
-#       once per act, so it is ~6x the head; ~8.5 TFLOP/s achieved against 29.8 fp32 / 59.5
-#       TF32 peak. Check which precision XLA is actually picking for the convs first.
+# Measured 2026-09-13, 3080 + 24-thread host, 64 envs, batch 256, 1:1 act/train, steady state,
+# each step of the chain over two or three runs:
+#   1034 env steps/s   where the profiling started
+#   1112              --xla_gpu_force_conv_nhwc, since removed: see TRUNK_DTYPE
+#   1237-1261         the priority write-back queued, PRIO_QUEUE_LEN
+#   2152-2153         the trunk's convolutions in bfloat16, TRUNK_DTYPE
+# That is 61.9 -> 29.7 ms an iteration, ~8.6k ALE frames/s, ~6.5h for 50M env steps / 200M frames.
+#
+# From a jax.profiler trace of gradient steps 20..80 (`--profile 20:60`), per iteration. The
+# kernel durations are the device's own and stand as they are; every host span carries CUPTI's
+# per-launch cost, which is now most of what the trace measures -- it reports a 54.6 ms iteration
+# against the 29.7 the rate scalar sees -- so read a host span as its share of 54.6, never
+# against the real wall:
+#   device kernels  23.0 ms   1153 launches an iteration, median 1.3 us -- 77% of the real 29.7
+#   learn_step      41.6 ms   host, of 54.6; almost all of it inside the executable call
+#   env.step         2.9 ms   host, ALE; it launches nothing, so the inflation misses it
+#   observe          0.3 ms   host: 0.22 ms of it in the buffer's save_step, 0.04 in update_prios
+#   act transfer     0.1 ms   host; the overlap works, this one is free
+# Convolutions still carry the device, at ~18% of it, but no longer dominate it; what is left of
+# the idle is the launch-bound tail, 81% of launches under 5 us for 6% of device time. Shrinking
+# that means fewer kernels rather than faster ones, and nothing below has found a way to.
+#
+# Measured and rejected, so they do not get tried twice:
+#   nnx.cached_partial          cuts dispatch Python calls 4x (1.5M -> 369k per 25 steps) and
+#                               does not move wall time; the cost is inside the executable call,
+#                               not the graph traversal.
+#   XLA command buffers         no change, at any --xla_gpu_enable_command_buffer setting.
+#   TF32 matmul precision       JAX_DEFAULT_MATMUL_PRECISION moves dots, not cuDNN's convs,
+#                               which pick their own math type; no change either way.
+#   dropping the diagnostics    0.8 ms/step of 59, so utils' "costs nothing" claim holds.
+#   dropping SpectralNorm       2.0 ms/step of 59. Not where the time goes.
+#   PRIO_QUEUE_LEN = 5          1280 against 1237 and 1261 at 3, inside the run-to-run spread,
+#                               so the shallower queue and its smaller stale window stand.
+#   --xla_gpu_force_conv_nhwc   worth 8% while the trunk was float32, nothing once it is
+#                               bfloat16: XLA already lays 16-bit convolutions out NHWC.
 # TODO: donate_argnums on the jitted steps to avoid param copies.
-# TODO: overlap the host side further: sample batches on a background thread and queue them so
-#       the transfer runs alongside env.step, and consider moving buf.save_step off the main
-#       thread too. Measure first -- the host is at ~1.4 of 24 cores, so this only pays if the
-#       main thread is actually blocking the device. A full actor/learner split, which would
-#       make train_step independent of collection, is the larger version of the same idea.
-# TODO: profile with jax.profiler; check whether the Impala trunk or the buffer dominates.
+# TODO: the head and the loss are still float32. They are ~1/6 of the trunk's FLOPs, so this is
+#       worth far less than the trunk was, and the quantile axes make the loss the part of the
+#       graph where precision is least obviously free. Measure before assuming it is.
+
+# === Precision ===
+# TRUNK_DTYPE has only been checked over 12.5k gradient steps, ~3.2M ALE frames, which is 1.6%
+# of the 200M-frame budget. What is measured there: the trunk's features carry 0.7% relative L2
+# error against an identical float32 net and its weight gradients 0.9% median, both a small
+# multiple of bfloat16's own 0.39% rounding unit; over a run, spectral_sigma and weight_rms track
+# float32 to three digits and dormant_frac and dead_frac stay at zero. What that does not cover
+# is anything that only appears once the TD error has shrunk by orders of magnitude, which is
+# most of training. Nothing compounds by construction -- the parameters and Adam's moments are
+# float32, so no rounding accumulates in the weights, and bfloat16 keeps float32's exponent range
+# so nothing underflows -- but a 1% perturbation of the gradient is still a change to the search.
+# TODO: check TRUNK_DTYPE over a long run against the 951k-step float32 curve in logs/ before
+#       trusting it at 200M frames. It is one constant; float32 costs 2152 -> 1249 env steps/s.
 
 # === Reproduction / tuning ===
 # TODO: verify against BTR's reported Breakout curve before adding anything new.
@@ -177,7 +223,7 @@ class QNet(nnx.Module):
         self.num_actions = num_actions
 
         self.decoder = ImpalaCNNLarge(
-            obs_stack, size_factor=IMPALA_SIZE_FACTOR, rngs=rngs
+            obs_stack, size_factor=IMPALA_SIZE_FACTOR, dtype=TRUNK_DTYPE, rngs=rngs
         )
         self.quantile_embedding = IQNCosineEmbedding(
             self.decoder.out_features, num_cosines=IQN_NUM_COS, rngs=rngs
@@ -562,9 +608,9 @@ class BTR(Agent):
     frames and the run counts env steps.
     """
 
-    # The priorities of a batch still on the device, which nnx would otherwise refuse on a
-    # static attribute of a pytree class.
-    _pending_prios: tuple[npt.NDArray[np.uint32], jax.Array] | None = None
+    # The batches whose priorities are still on the device, oldest first: each is the indices
+    # learn_step drew and the array it left in flight for them. observe empties it.
+    _prio_queue: deque[tuple[npt.NDArray[np.uint32], jax.Array]]
 
     def __init__(
         self, num_actions: int, obs_stack: int, *, frames_per_step: int, seed: int
@@ -576,7 +622,7 @@ class BTR(Agent):
         self._num_updates = 0
         self._max_prio = 1.0
         self._buf: ReplayBuffer | None = None
-        self._pending_prios = None
+        self._prio_queue = deque()
 
         self.rngs = create_rngs(seed)
         self.qnet = QNet(num_actions, obs_stack=obs_stack, rngs=self.rngs)
@@ -671,22 +717,36 @@ class BTR(Agent):
     @override
     def observe(self, step: EnvStep) -> None:
         """
-        Settle up for the last gradient step, then store.
+        Settle up for the gradient steps that have finished, then store.
 
-        That order is the whole reason the priority write is deferred rather than forced inside
-        ``learn_step``: a batch is drawn at the end of one iteration and its priorities written
-        at the start of the next, with no save_step in between, so no slot the batch names can
-        have been recycled underneath it. Forcing the transfer here rather than at dispatch is
-        also what lets ``learn_step`` overlap the environment -- the device has had the whole of
-        ``env.step``.
+        Settling up is a device transfer, and reading back the step just dispatched costs the
+        host the whole of that step -- 12.9 ms an iteration, against 0.22 ms in ``save_step``
+        below. ``PRIO_QUEUE_LEN - 1`` batches stay in flight instead, so the transfer reads a
+        step the device finished iterations ago and the sampling and upload in the following
+        ``learn_step`` overlap the one still running.
+
+        What that spends is the exactness of the write-back. A batch is drawn against one write
+        head and written back against a head ``PRIO_QUEUE_LEN - 1`` save_steps further on, so a
+        slot within that distance of wrapping has been recycled underneath it and its new
+        occupant takes the old one's priority. A save_step advances a head once, twice across an
+        episode boundary, which bounds it at ``2 * (PRIO_QUEUE_LEN - 1)`` slots of an
+        environment's capacity -- four of 16384 here, so 0.06 draws of a 256 batch. It cannot
+        make an unsamplable slot drawable: the buffer rejects a proposal on slot type, not on
+        priority.
+
+        The other half of that is what the delayed batches are still worth to the sampler: until
+        its write-back lands, a batch keeps the priority it was drawn on, so the transitions of
+        the last ``PRIO_QUEUE_LEN - 1`` gradient steps are offered at the error that selected
+        them rather than the one they now have, and are drawn again at it. ``PER_ALPHA`` is low
+        enough that the draw is near uniform, which puts that at 256 * 256 / 1048576 = 0.06 of a
+        batch per following draw, 0.13 over the two -- the same order as the recycling above, and
+        growing with ``PRIO_QUEUE_LEN`` the same way.
         """
         assert self._buf is not None, "observe before init"
 
-        # TODO: Maybe put a small queue of `EnvStep`s here and make pending prios a queue too?
-        if self._pending_prios is not None:
-            indices, prios = self._pending_prios
+        while PRIO_QUEUE_LEN <= len(self._prio_queue):
+            indices, prios = self._prio_queue.popleft()
             self._buf.update_prios(indices, jax.device_get(prios))
-            self._pending_prios = None
 
         self._buf.save_step(
             step.actions.astype(np.uint8),
@@ -727,13 +787,13 @@ class BTR(Agent):
         )
         new_prios.copy_to_host_async()
 
-        if self._pending_prios is not None:
+        if PRIO_QUEUE_LEN <= len(self._prio_queue):
             raise RuntimeError(
-                "two learn_steps with no observe between them: the batch already in flight\n"
-                "would never be written back, leaving transitions the last gradient step\n"
-                "already fitted at the priority they were drawn on"
+                "learn_steps outrunning observes: the oldest batch in flight would never be\n"
+                "written back, leaving transitions the gradient steps since already fitted at\n"
+                "the priority they were drawn on"
             )
-        self._pending_prios = (batch_indices, new_prios)
+        self._prio_queue.append((batch_indices, new_prios))
 
         self._num_updates += 1
         if self._num_updates % INFERENCE_SYNC_FREQ == 0:

@@ -12,7 +12,7 @@ from collections.abc import Collection
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.typing import ArrayLike
+from jax.typing import ArrayLike, DTypeLike
 
 from .internals import SpectralNorm
 
@@ -143,13 +143,18 @@ class ImpalaResSubBlock(nnx.Module):
         out_features: int,
         *,
         rngs: nnx.Rngs,
+        dtype: DTypeLike | None = None,
     ) -> None:
         self.conv0 = SpectralNorm(
-            nnx.Conv(in_features, out_features, kernel_size=(3, 3), rngs=rngs),
+            nnx.Conv(
+                in_features, out_features, kernel_size=(3, 3), dtype=dtype, rngs=rngs
+            ),
             rngs=rngs,
         )
         self.conv1 = SpectralNorm(
-            nnx.Conv(out_features, out_features, kernel_size=(3, 3), rngs=rngs),
+            nnx.Conv(
+                out_features, out_features, kernel_size=(3, 3), dtype=dtype, rngs=rngs
+            ),
             rngs=rngs,
         )
 
@@ -169,10 +174,17 @@ class ImpalaBlock(nnx.Module):
         out_features: int,
         *,
         rngs: nnx.Rngs,
+        dtype: DTypeLike | None = None,
     ) -> None:
-        self.conv0 = nnx.Conv(in_features, out_features, kernel_size=(3, 3), rngs=rngs)
-        self.res1 = ImpalaResSubBlock(out_features, out_features, rngs=rngs)
-        self.res2 = ImpalaResSubBlock(out_features, out_features, rngs=rngs)
+        self.conv0 = nnx.Conv(
+            in_features, out_features, kernel_size=(3, 3), dtype=dtype, rngs=rngs
+        )
+        self.res1 = ImpalaResSubBlock(
+            out_features, out_features, dtype=dtype, rngs=rngs
+        )
+        self.res2 = ImpalaResSubBlock(
+            out_features, out_features, dtype=dtype, rngs=rngs
+        )
 
     def __call__(self, x: ArrayLike) -> jax.Array:
         x = jnp.asarray(x)
@@ -187,19 +199,43 @@ POOLED_SIZE = (6, 6)  # what adaptive_max_pool maps the trunk's spatial dims to
 
 
 class ImpalaCNNLarge(nnx.Module):
+    """
+    ``dtype`` is the convolutions' compute dtype, as everywhere in Flax. What it does and does
+    not reach, for a 16-bit one:
+
+    - Parameters are float32 and stay float32. Each convolution casts a copy down for the call,
+      so nothing accumulates rounding across steps the way a 16-bit master weight would.
+    - The forward activations through the three blocks are ``dtype``. The trunk casts back
+      before returning, so the head, the loss and the diagnostics never see a 16-bit array.
+    - The backward pass is ``dtype`` as well: cuDNN accumulates the data and weight gradients in
+      float32 internally but writes both out in ``dtype``, so the gradient reaching a float32
+      parameter carries only ``dtype``'s precision. Measured against an otherwise identical
+      float32 net on one batch, bfloat16 puts 0.7% relative L2 error on the features and 0.9%
+      median (1.5% worst) on the trunk's weight gradients -- a few times bfloat16's own 0.39%
+      rounding unit, so an accumulation over layers rather than an amplification.
+    - SpectralNorm wraps the convolutions rather than sitting inside them, so its power
+      iteration and the normalised weight it projects with are float32 regardless.
+
+    A 16-bit dtype is also what cuDNN's tensor cores read. Given float32 it runs them anyway, on
+    a TF32 copy it stages with a conversion pass per convolution, which costs a sixth of device
+    time and more than doubles what the convolutions themselves take. See btr.py's performance
+    block for both halves of that measurement.
+    """
+
     def __init__(
         self,
         in_features: int,
         *,
         rngs: nnx.Rngs,
         size_factor: int,
+        dtype: DTypeLike | None = None,
     ) -> None:
         self.size_factor = size_factor
 
         n = self.size_factor
-        self.block0 = ImpalaBlock(in_features, n * 16, rngs=rngs)
-        self.block1 = ImpalaBlock(n * 16, n * 32, rngs=rngs)
-        self.block2 = ImpalaBlock(n * 32, n * 32, rngs=rngs)
+        self.block0 = ImpalaBlock(in_features, n * 16, dtype=dtype, rngs=rngs)
+        self.block1 = ImpalaBlock(n * 16, n * 32, dtype=dtype, rngs=rngs)
+        self.block2 = ImpalaBlock(n * 32, n * 32, dtype=dtype, rngs=rngs)
 
     @property
     def out_channels(self) -> int:
@@ -221,7 +257,7 @@ class ImpalaCNNLarge(nnx.Module):
         # relu is monotonic, so max(relu(x)) == relu(max(x)).
         x = nnx.relu(x)
         x = adaptive_max_pool(x, POOLED_SIZE)
-        return x.reshape(*x.shape[:-3], -1)
+        return x.reshape(*x.shape[:-3], -1).astype(jnp.float32)
 
 
 class IQNCosineEmbedding(nnx.Module):

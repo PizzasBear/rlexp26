@@ -119,8 +119,24 @@ def main() -> None:
         default=None,
         help="carry on from the newest checkpoint in this run directory, ./checkpoints/<run>",
     )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        metavar="START:COUNT",
+        help="trace COUNT gradient steps, from START gradient steps into this run, to its logdir",
+    )
     args = parser.parse_args()
     resume: Path | None = args.resume
+    # Counted in gradient steps taken by this process rather than in iterations: that is what
+    # the rest of the run paces itself by, and it puts the window past the buffer fill -- which
+    # a resumed run pays again -- without having to know how long that takes.
+    profile_start, profile_count = 0, 0
+    if args.profile:
+        start, _, count = args.profile.partition(":")
+        if not (start.isdigit() and count.isdigit() and int(count)):
+            parser.error("--profile takes START:COUNT, START >= 0 and COUNT >= 1")
+        profile_start, profile_count = int(start), int(count)
 
     with ExitStack() as stack:
         # closing() rather than enter_context: gymnasium gives Env a context manager but not
@@ -189,7 +205,10 @@ def main() -> None:
             num_env_steps = restored["num_env_steps"]
             print(f"RESUMED {run_name} at {agent.num_updates} gradient steps")
 
-        writer = stack.enter_context(SummaryWriter(f"./logs/{run_name}"))
+        # Named here rather than inside the writer: a profile trace is written beside the
+        # scalars, under the same run, so TensorBoard shows both together.
+        logdir = f"./logs/{run_name}"
+        writer = stack.enter_context(SummaryWriter(logdir))
         evaluator = stack.enter_context(
             closing(Evaluator(agent.make_policy, EVAL_SEED))
         )
@@ -203,12 +222,6 @@ def main() -> None:
 
         actions, extras = agent.act(obs, num_env_steps=num_env_steps)
         actions, extras = jax.device_get((actions, extras))
-
-        # Measured 2026-09-06, 3080 + 24-thread host, 64 envs, batch 256:
-        #   pre-train-start: ~1000 env steps/s
-        #   steady state:    ~910 env steps/s (~3.6k ALE frames/s), i.e. ~15h for 50M env steps
-        #   GPU 80% util, 324W of a 370W cap, 84C -- power/thermally limited, so it is the wall
-        #   host CPU ~1.4 cores of 24 (main thread ~40%, 16 ALE threads ~5% each): not the wall
 
         stats_queue = deque[PendingStats]()
         num_updates = agent.num_updates
@@ -295,13 +308,59 @@ def main() -> None:
         # row is written, and after the checkpoint, which is the write worth losing least.
         stack.callback(drain_stats, 0)
         stack.callback(checkpoint_final)
+
+        profiling = False
+        # The gradient step the trace window opens on, fixed at the first one this process
+        # takes rather than read off --profile directly: --resume restores num_updates past
+        # profile_start, and the buffer refill that follows advances it not at all, so a window
+        # cut straight from it would open immediately and span the whole refill.
+        profile_at: int | None = None
+
+        def stop_profile() -> None:
+            """
+            Close the trace window, if one is open.
+
+            Registered on the stack as well as called from the loop, and first on the unwind so
+            that the teardown below stays outside the window: JAX writes the trace out in
+            stop_trace, so an interrupt taken mid-window -- which is how a run usually ends --
+            would otherwise pay the profiling overhead and leave nothing behind.
+            """
+            nonlocal profiling
+            if not profiling:
+                if profile_count:
+                    print("PROFILE NOT TAKEN -- the run ended before the window opened")
+                return
+            # As at the open: the window ends where the device is idle, or the kernels
+            # still in flight land outside it and the last iterations read as free.
+            jax.block_until_ready(checkpointables())  # type: ignore[no-untyped-call]
+            jax.profiler.stop_trace()  # type: ignore[no-untyped-call]
+            profiling = False
+            print(f"PROFILED {profile_at}..{num_updates} into {logdir}")
+
+        stack.callback(stop_profile)
         interrupted = stack.enter_context(interruptible())
 
         evaluator.submit(agent.policy_weights(), num_updates, num_env_steps)
 
         while not interrupted():
+            if profile_count and profile_at is not None:
+                if not profiling and num_updates >= profile_at:
+                    # Both ends of the window wait on the device, or it opens over the tail of
+                    # a step dispatched before it and the per-iteration totals inside it are
+                    # the wrong shape. The agent's state is what the last gradient step wrote,
+                    # so waiting on that waits on the step. Not jax.effects_barrier: it blocks
+                    # on ordered effects, of which this program has none, so it returns without
+                    # the device having done anything.
+                    jax.block_until_ready(checkpointables())  # type: ignore[no-untyped-call]
+                    jax.profiler.start_trace(str(logdir))
+                    profiling = True
+                elif profiling and num_updates >= profile_at + profile_count:
+                    stop_profile()
+                    profile_count = 0
+
             num_env_steps += env.num_envs
-            next_obs, rewards, terminated, truncated, _info = env.step(actions)
+            with jax.profiler.TraceAnnotation("env.step"):
+                next_obs, rewards, terminated, truncated, _info = env.step(actions)
 
             next_actions, next_extras = agent.act(next_obs, num_env_steps=num_env_steps)
             jax.copy_to_host_async((next_actions, next_extras))  # type: ignore[no-untyped-call]
@@ -321,17 +380,18 @@ def main() -> None:
             # env.step to finish the step that produced them.
             drain_stats(STATS_QUEUE_LEN - 1)
 
-            agent.observe(
-                EnvStep(
-                    obs=obs,
-                    actions=actions,
-                    rewards=rewards,
-                    terminated=terminated,
-                    truncated=truncated,
-                    next_obs=next_obs,
-                    extras=extras,
+            with jax.profiler.TraceAnnotation("agent.observe"):
+                agent.observe(
+                    EnvStep(
+                        obs=obs,
+                        actions=actions,
+                        rewards=rewards,
+                        terminated=terminated,
+                        truncated=truncated,
+                        next_obs=next_obs,
+                        extras=extras,
+                    )
                 )
-            )
 
             for result in evaluator.drain():
                 last_eval = result
@@ -379,9 +439,12 @@ def main() -> None:
 
             # Zero gradient steps while the agent is still collecting, which is also why every
             # frequency below is inside this branch: they are all counted in gradient steps.
-            grad_steps, learn_stats = agent.learn_step()
+            with jax.profiler.TraceAnnotation("agent.learn_step"):
+                grad_steps, learn_stats = agent.learn_step()
             if grad_steps:
                 num_updates = agent.num_updates
+                if profile_count and profile_at is None:
+                    profile_at = num_updates + profile_start
 
                 # Only the logging iterations pay a transfer for the scalars.
                 if num_updates - last_train_log_updates >= TRAIN_LOG_FREQ:
@@ -408,7 +471,8 @@ def main() -> None:
                     ckptr.save_checkpointables_async(num_updates, checkpointables())
 
             obs = next_obs
-            actions, extras = jax.device_get((next_actions, next_extras))
+            with jax.profiler.TraceAnnotation("act transfer"):
+                actions, extras = jax.device_get((next_actions, next_extras))
             for name, value in extras.items():
                 act_sums[name] = act_sums.get(name, 0.0) + float(value.mean())
             act_count += 1
