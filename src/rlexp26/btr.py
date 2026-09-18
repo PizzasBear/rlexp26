@@ -812,6 +812,7 @@ def _behaviour(
     actions, log_probs = act(
         obs,
         rngs=rngs,
+        soft_sampling=not evaluation and ACT_USE_SOFT_POLICY,
         epsilon=epsilon,
     )
     return actions, {"log_prob": log_probs}
