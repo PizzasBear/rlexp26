@@ -75,12 +75,14 @@ impl From<ReplayBufferError> for PyErr {
 ///
 /// [`PyArrayLikeDyn`] takes a NumPy array of exactly this dtype as a borrow, and falls back to
 /// rebuilding anything else NumPy can read -- a list, a JAX array -- element by element through
-/// the sequence protocol. That fallback goes via `Vec<T>`, which pyo3 cannot produce for
-/// [`half::f16`]: there is no conversion from a Python float to one. `f16` therefore takes a real
-/// NumPy `float16` array and nothing else, which is what the caller should be passing anyway.
+/// the sequence protocol. That fallback goes via `Vec<T>`, which pyo3 cannot produce for either
+/// half-precision type: there is no conversion from a Python float to one. `f16` and `bf16`
+/// therefore take a real NumPy array of their own dtype and nothing else, which is what the
+/// caller should be passing anyway.
 ///
 /// Both types expose `as_array`, so only the type named here differs between the two paths.
 macro_rules! dyn_py_arg {
+    (BF16, $lt:lifetime, $ty:ty) => { numpy::PyReadonlyArrayDyn<$lt, $ty> };
     (F16, $lt:lifetime, $ty:ty) => { numpy::PyReadonlyArrayDyn<$lt, $ty> };
     ($variant:ident, $lt:lifetime, $ty:ty) => { PyArrayLikeDyn<$lt, $ty> };
 }
@@ -89,8 +91,8 @@ macro_rules! dyn_py_arg {
 ///
 /// pyo3's own reads `'ndarray' object is not an instance of 'ndarray'` -- accurate, in that the
 /// array handed over is not an array of the stored dtype, and unreadable. Name the argument, what
-/// the buffer stores and what turned up instead, which for a `float16` buffer also explains the
-/// one dtype that refuses a list; see [`dyn_py_arg`].
+/// the buffer stores and what turned up instead, which for a half-precision buffer also explains
+/// the two dtypes that refuse a list; see [`dyn_py_arg`].
 fn wrong_dtype(name: &str, dtype: DType, obj: &Bound<'_, PyAny>) -> PyErr {
     let py = obj.py();
     let got = match obj.cast::<PyUntypedArray>() {

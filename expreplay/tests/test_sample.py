@@ -2,6 +2,7 @@
 
 from typing import Any
 
+import ml_dtypes
 import numpy as np
 import pytest
 
@@ -59,7 +60,8 @@ def play(
 
 # Every dtype the buffer stores, in the order `dyn_array.rs` lists them. These only reach
 # Python -- `cargo test` builds no interpreter, so the boundary that converts them is the one
-# thing the Rust tests cannot touch.
+# thing the Rust tests cannot touch. `bfloat16` is not numpy's: importing ml_dtypes is what
+# registers it, and the buffer refuses it like any other unsupported dtype where nothing has.
 DTYPES: list[type[np.generic]] = [
     np.uint8,
     np.uint16,
@@ -70,6 +72,7 @@ DTYPES: list[type[np.generic]] = [
     np.int32,
     np.int64,
     np.float16,
+    ml_dtypes.bfloat16,
     np.float32,
     np.float64,
 ]
@@ -149,19 +152,23 @@ def test_a_mismatched_dtype_says_which_argument_and_what_it_wanted() -> None:
         )
 
 
-def test_float16_takes_a_real_array_and_nothing_else() -> None:
-    """The one dtype with no element-by-element fallback: pyo3 cannot build an f16 from a float."""
+@pytest.mark.parametrize("dtype", [np.float16, ml_dtypes.bfloat16])
+def test_half_precision_takes_a_real_array_and_nothing_else(
+    dtype: type[np.generic],
+) -> None:
+    """The dtypes with no element-by-element fallback: pyo3 builds neither from a float."""
+    name = np.dtype(dtype).name
     rb = ReplayBuffer(
-        NUM_ENVS, CAPACITY, obs_shape=(2,), obs_dtype=np.float16, act_dtype=np.uint8
+        NUM_ENVS, CAPACITY, obs_shape=(2,), obs_dtype=dtype, act_dtype=np.uint8
     )
-    rb.reset(np.zeros((NUM_ENVS, 2), np.float16))
+    rb.reset(np.zeros((NUM_ENVS, 2), dtype))
 
     not_an_array = [[0.0, 0.0]] * NUM_ENVS  # the refusal below is the point of the test
-    with pytest.raises(TypeError, match="obs must be a float16 array, got a list"):
+    with pytest.raises(TypeError, match=f"obs must be a {name} array, got a list"):
         rb.reset(not_an_array)  # type: ignore[arg-type]
 
     # Not a cast either -- a float32 array is refused the same way every other dtype is.
-    with pytest.raises(TypeError, match="obs must be a float16 array"):
+    with pytest.raises(TypeError, match=f"obs must be a {name} array"):
         rb.reset(np.zeros((NUM_ENVS, 2), np.float32))
 
 

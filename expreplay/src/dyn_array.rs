@@ -28,9 +28,27 @@ macro_rules! for_all_dtypes {
             I32 => i32,
             I64 => i64,
             F16 => half::f16,
+            BF16 => half::bf16,
             F32 => f32,
             F64 => f64,
         }
+    };
+}
+
+/// The NumPy descriptor for one supported dtype, or `None` when this interpreter has no such
+/// dtype.
+///
+/// Only `bfloat16` can be missing. NumPy has none of its own: the one a `half::bf16` array uses
+/// is registered by whichever package provides it -- `ml_dtypes`, which JAX and PyTorch both pull
+/// in -- and rust-numpy's `Element` impl panics when nothing has. Looking it up by name instead
+/// makes its absence an ordinary missing dtype, which is what it is to a caller who asked for
+/// something else entirely.
+macro_rules! np_descr {
+    (BF16, $py:expr, $ty:ty) => {
+        PyArrayDescr::new($py, "bfloat16").ok()
+    };
+    ($variant:ident, $py:expr, $ty:ty) => {
+        Some(numpy::dtype::<$ty>($py))
     };
 }
 
@@ -43,6 +61,9 @@ macro_rules! def_dtype {
 
         impl DType {
             /// The NumPy descriptor for this dtype.
+            ///
+            /// Infallible, unlike the probe in [`Self::from_np`]: a `DType` naming a dtype
+            /// NumPy does not have is one that call could not have returned.
             pub fn np<'py>(self, py: Python<'py>) -> Bound<'py, PyArrayDescr> {
                 match self {
                     $(Self::$variant => numpy::dtype::<$ty>(py),)+
@@ -51,18 +72,24 @@ macro_rules! def_dtype {
 
             /// Matches a NumPy dtype, or anything NumPy can read as one, against the supported
             /// list. Rejection names every dtype that would have been accepted, built from the
-            /// same list rather than written out by hand.
+            /// same list rather than written out by hand -- bar any this interpreter does not
+            /// have, which are no use to the caller either; see [`np_descr`].
             pub fn from_np<'py>(dtype: &Bound<'py, PyAny>) -> PyResult<Self> {
                 let py = dtype.py();
 
                 let descr = PyArrayDescr::new(py, dtype)?;
 
-                $(if descr.is_equiv_to(&numpy::dtype::<$ty>(py)) {
+                $(if np_descr!($variant, py, $ty).is_some_and(|d| descr.is_equiv_to(&d)) {
                     Ok(Self::$variant)
                 } else)+ {
                     Err(PyTypeError::new_err(format!(
                         "Unsupported dtype {descr}, ReplayBuffer supports {}",
-                        [$(numpy::dtype::<$ty>(py).to_string(),)+].join(", "),
+                        [$(np_descr!($variant, py, $ty),)+]
+                            .into_iter()
+                            .flatten()
+                            .map(|d| d.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
                     )))
                 }
             }

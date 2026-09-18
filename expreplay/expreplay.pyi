@@ -66,9 +66,11 @@ class ReplayBuffer:
         ``obs_shape`` and ``act_shape`` describe a single observation and action; the environment
         and slot axes are prepended internally. Either dtype may be any of ``uint8``, ``uint16``,
         ``uint32``, ``uint64``, ``int8``, ``int16``, ``int32``, ``int64``, ``float16``,
-        ``float32`` or ``float64``; anything else raises ``TypeError``. Note that ``float16`` is
-        the one dtype with no element-by-element fallback on the way in -- :meth:`reset` and
-        :meth:`save_step` take a real ``numpy`` array of it and nothing else.
+        ``bfloat16``, ``float32`` or ``float64``; anything else raises ``TypeError``, and so does
+        ``bfloat16`` itself where nothing has registered it with ``numpy`` (it is ``ml_dtypes``'
+        dtype, not one of ``numpy``'s own). Note that ``float16`` and ``bfloat16`` are the dtypes
+        with no element-by-element fallback on the way in -- :meth:`reset` and :meth:`save_step`
+        take a real ``numpy`` array of them and nothing else.
 
         ``obs_stack`` makes :meth:`sample` return that many consecutive frames per observation
         and lets :meth:`save_step` accept an environment's stacked observation directly. Only one frame
