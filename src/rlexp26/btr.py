@@ -146,16 +146,6 @@ SCALE_LOG_FREQ = 2500
 # +--------------+
 
 # === Correctness to settle ===
-# TODO: the Munchausen log-policy term is read off target_qnet, which is what the Munchausen
-#       paper's Eq. 7 and BTR's Eq. E1 both write. BTR's *code* reads it off the online net
-#       (`q_k_target = self.net.qvals(states)` in Agent.py), and that is the version their
-#       published curve came from. Paper-vs-code, not ambiguity; the two differ by up to
-#       TARGET_NETWORK_UPDATE_FREQ steps of staleness. Decide which to follow.
-#       Their version is also the fast one, and by more than anything else on this list: the
-#       online pass already computes q_quants.mean(-2) for policy_entropy, so the log-policy
-#       comes off it for a stop_gradient and the third trunk pass goes. Measured at 22.6 ms
-#       a gradient step against 26.2, -13.8% and the only double-digit saving the profiling
-#       found. Do not take it for the speed -- but it is not a tie-break to leave out either.
 # TODO: NoisyNets' sigma is drifting rather than being learned, and a remedy has to be picked.
 #       Over two full runs, and unmoved by PER_BETA, every NoisyLinear's noisy_sigma_neg_frac
 #       leaves 0 for 0.37-0.48 and its noisy_sigma_signed collapses to zero, while every sigma
@@ -216,10 +206,33 @@ SCALE_LOG_FREQ = 2500
 #   save_step                           0.07 ms host; update_prios 0.006
 # The device is 26.2 ms of the 28.4 and the host, at ~22, has slack -- so every host saving
 # below measured zero on the wall, and only device work is worth cutting. _train_step's device
-# time is its three trunk passes and nothing else: 4.4 ms for the Munchausen target pass on
-# obs, 4.4 for the target on next_obs, 16.7 for the online forward and backward, summing to the
-# whole within 0.5%. The trunk holds ~30 TFLOP/s of bfloat16, about half of what this card does
-# dense, so there is no large kernel-level win left under it either.
+# time is its trunk passes and nothing else: 4.4 ms for the Munchausen pass over obs, 4.4 for
+# the target on next_obs, 16.7 for the online forward and backward, summing to the whole within
+# 0.5%. The trunk holds ~30 TFLOP/s of bfloat16, about half of what this card does dense, so
+# there is no large kernel-level win left under it either.
+#
+# That first pass has since gone -- loss_fn reads the Munchausen log-policy off the online one
+# -- so the table above is a three-pass gradient step. The same harness on Zaxxon, the two back
+# to back, 280 s each: 2304 -> 2614 env steps/s, +13.5%, 27.8 -> 24.5 ms an iteration, with the
+# slower run's p90 below the faster run's p10.
+#
+# The loop is still device-bound after that, but the margin narrowed enough that the host is
+# worth cutting too. By perf/split_train_step.py, three runs each, and a BENCH_RR=0/64 run for
+# the host cost left when no gradient step is taken at all:
+#   _train_step         22.0 ms device (21.8-22.8), against 26.4 with the third pass (26.4-26.5)
+#                       14.1 ms host to dispatch, 7.0 with its modules bound
+#   _act, 64 envs        1.8 ms device, 1.7 ms host, bound
+#   loop, no grad step  12154 env steps/s, 5.3 ms an iteration -- env.step, save_step and _act
+# So ~14 ms of host against ~24 of device in a 24.5 ms iteration, and the GPU sets the rate.
+#
+# Binding _train_step's modules (see __init__) is that 14.1 -> 7.0, and what is left is still
+# nnx's: nnx.split of the four alone is 5.1 ms for 297 array leaves, against a 1.1 ms jax.jit
+# dispatch floor for the same arrays -- which is what a pure-JAX kernel over a state pytree
+# would cost, and the only way to get the remaining 6. The binding buys no wall time, exactly as
+# the entry it replaces predicted: 2633 env steps/s against 2457 in one pair, with an earlier
+# run of the same unbound code at 2614, so run-to-run drift swamps it. It is taken for the CPU,
+# which is real and is not free elsewhere on the machine: 3.77 cores against 3.87 over an equal
+# wall, 92 against 101 ms of CPU a gradient step.
 #
 # Gradient steps an iteration against env steps/s, everything else held (perf/sweep.sh):
 #   1 -> 2253     2 -> 1150     4 -> 602     8 -> 294
@@ -242,17 +255,6 @@ SCALE_LOG_FREQ = 2500
 # that means fewer kernels rather than faster ones, and nothing below has found a way to.
 #
 # Measured and rejected, so they do not get tried twice:
-#   nnx.cached_partial          cuts dispatch Python calls 4x (1.5M -> 369k per 25 steps) and
-#                               does not move wall time -- but not because the traversal is
-#                               cheap, which is what this entry used to say. cProfile puts 81%
-#                               of a _train_step dispatch in nnx's graph flatten/unflatten, and
-#                               binding the same four modules into an equivalent kernel takes
-#                               its host cost 10.4 -> 3.0 ms. The host is simply not what the
-#                               loop waits on. Note for whoever tries it again: _train_step
-#                               takes its modules keyword-only and cached_partial binds only
-#                               positional ones, so it cannot be applied as the signature
-#                               stands. The place it would pay is the evaluator's thread, where
-#                               the same traversal is spent per env step against the GIL.
 #   XLA command buffers         no change, at any --xla_gpu_enable_command_buffer setting.
 #   TF32 matmul precision       JAX_DEFAULT_MATMUL_PRECISION moves dots, not cuDNN's convs,
 #                               which pick their own math type; no change either way.
@@ -574,17 +576,17 @@ def _act(
 
 @nnx.jit(static_argnames=("num_samples",))
 def _train_step(
-    *,
     qnet: QNet,
     target_qnet: QNet,
     opt: nnx.Optimizer[QNet],
+    rngs: nnx.Rngs,
+    *,
     sample_prios: ArrayLike,
     obs: ArrayLike,
     actions: ArrayLike,
     rewards: ArrayLike,
     dones: ArrayLike,
     next_obs: ArrayLike,
-    rngs: nnx.Rngs,
     discount: float = DISCOUNT,
     n_steps: int = N_STEP,
     num_samples: int = IQN_TRAIN_SAMPLES,
@@ -618,15 +620,32 @@ def _train_step(
     def loss_fn(
         qnet: QNet, target_qnet: QNet, rngs: nnx.Rngs
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
-        target_qnet_qs = target_qnet.random_n_samples_mean(obs, num_samples, rngs=rngs)
-        target_logits = nnx.log_softmax(target_qnet_qs / temperature)
-        target_action_log_probs = jnp.take_along_axis(target_logits, actions, -1)
+        samples = rngs.samples.uniform((*obs.shape[:-3], num_samples))
+        q_quants, outputs = nnx.capture(
+            qnet, nnx.Intermediate, method_outputs=nnx.Intermediate
+        )(obs, samples=samples, rngs=rngs)
+        features = jnp.asarray(outputs["decoder"]["__call__"][0], jnp.float32)
+        action_q_quants = jnp.take_along_axis(q_quants, actions[..., None], -1)
+
+        policy_log_probs = nnx.log_softmax(q_quants.mean(-2) / temperature)
+        policy_entropy = -jnp.sum(jnp.exp(policy_log_probs) * policy_log_probs, -1)
+
+        # Munchausen's log-policy is read off that online pass, over its samples rather than a
+        # redraw, where the Munchausen paper's Eq. 7 and BTR's Eq. E1 both write the target net:
+        # BTR's *code* reads it online (`q_k_target = self.net.qvals(states)` in Agent.py) and
+        # that is the version its published curve came from. The two differ by up to
+        # TARGET_NETWORK_UPDATE_FREQ steps of staleness, and online drops a whole trunk pass over
+        # obs -- +13.5% on the run's rate, see the performance block. stop_gradient because the
+        # term is part of the target, not of what is being fitted.
+        action_log_probs = jax.lax.stop_gradient(
+            jnp.take_along_axis(policy_log_probs, actions, -1)
+        )
 
         # Added once, unscaled by n, with the clip inside the scaling -- Eq. E1 and BTR's code
         # agree, so the term stays a one-step correction bolted onto an n-step return rather
         # than being scaled by (gamma^n - 1)/(gamma - 1).
         munchausen_rewards = rewards + munchausen_scaling_term * (
-            temperature * target_action_log_probs
+            temperature * action_log_probs
         ).clip(munchausen_clipping_val, 0)
 
         next_samples = rngs.samples.uniform((*next_obs.shape[:-3], num_samples))
@@ -649,23 +668,6 @@ def _train_step(
             munchausen_rewards
             + jnp.where(dones, 0, discount**n_steps) * next_value_quants
         )
-
-        samples = rngs.samples.uniform((*obs.shape[:-3], num_samples))
-        # The only pass over the online net on states it is training on, so the only one whose
-        # trunk features are the right thing to measure plasticity on.
-        # method_outputs records what each method returned, so the trunk features come out of
-        # the pass the loss already needs. An uncaptured call records nothing, which is what
-        # leaves the target net -- whose state is checkpointed -- untouched.
-        # They arrive in IMPALA_DTYPE, which is the trunk's and nothing else's: the head casts
-        # them on its own way in, and float32 is what the scales below are read in.
-        q_quants, outputs = nnx.capture(
-            qnet, nnx.Intermediate, method_outputs=nnx.Intermediate
-        )(obs, samples=samples, rngs=rngs)
-        features = jnp.asarray(outputs["decoder"]["__call__"][0], jnp.float32)
-        action_q_quants = jnp.take_along_axis(q_quants, actions[..., None], -1)
-
-        policy_log_probs = nnx.log_softmax(q_quants.mean(-2) / temperature)
-        policy_entropy = -jnp.sum(jnp.exp(policy_log_probs) * policy_log_probs, -1)
 
         unscaled_td_error = target_q_quants[..., None, :] - action_q_quants
         pinball_weights = jnp.abs(samples[..., None] - (unscaled_td_error < 0))
@@ -911,10 +913,8 @@ class BTR(Agent):
             net.set_attributes(use_running_average=True, raise_if_not_found=False)
         # As in QNetPolicy: the walk over the acting net's graph is cached here rather than
         # repeated every iteration, and the sync_qnet writing into that net is seen through it
-        # because both hold the same Variable objects. Only _act can be bound this way --
-        # _train_step's optimizer changes graph structure across opt.update, and it holds qnet,
-        # so neither can be cached without the other. There is nothing to win there anyway;
-        # the performance block says why.
+        # because both hold the same Variable objects -- which is also why ``restore`` reaches
+        # a bound kernel. It is the modules never being *replaced* that keeps both valid.
         self._act = nnx.cached_partial(_act, self.inference_qnet)
 
         self.opt = nnx.Optimizer(
@@ -932,6 +932,17 @@ class BTR(Agent):
                 ),
             ),
             wrt=nnx.Param,
+        )
+
+        # Bound like _act: 14.1 -> 7.0 ms of host a call, all of it nnx's graph walk. Three
+        # things make it safe, each measured rather than reasoned about: opt.update leaves the
+        # graph structure alone, so the cache cannot go stale across a step; nnx.capture's
+        # sowing -- it assigns __captures__ on every submodule it walks -- still reaches these
+        # modules, so the plasticity diagnostics stay live and track the unbound kernel's to
+        # 4e-4; and none of it survives the call, so nnx.state(qnet) is the same 82 leaves a
+        # checkpoint held before. Bound last of all: it holds opt, which holds qnet.
+        self._train_step = nnx.cached_partial(
+            _train_step, self.qnet, self.target_qnet, self.opt, self.rngs
         )
 
     @property
@@ -1106,17 +1117,13 @@ class BTR(Agent):
                 batch_next_obs,
             ) = self._buf.sample(BATCH_SIZE, n_steps=N_STEP, discount=DISCOUNT)
 
-            new_prios, step_stats = _train_step(
-                qnet=self.qnet,
-                target_qnet=self.target_qnet,
-                opt=self.opt,
+            new_prios, step_stats = self._train_step(
                 sample_prios=batch_prios,
                 obs=batch_obs,
                 actions=batch_actions,
                 rewards=batch_rewards,
                 dones=batch_dones,
                 next_obs=batch_next_obs,
-                rngs=self.rngs,
             )
             new_prios.copy_to_host_async()
             self._prio_queue.append((batch_indices, new_prios))
