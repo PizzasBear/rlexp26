@@ -49,7 +49,7 @@ strict = true
 
 # These ship no py.typed; the notes otherwise bury real errors.
 [[tool.mypy.overrides]]
-module = ["optax.*", "etils.*", "orbax.*", "tensorboardX"]
+module = ["optax.*", "etils.*", "orbax.*", "tensorboard.*", "tensorboardX"]
 ignore_missing_imports = true
 
 # Vendored Flax primitives -- kept diffable against upstream, so not annotated.

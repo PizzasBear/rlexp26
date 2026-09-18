@@ -1,6 +1,6 @@
 import math
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from fractions import Fraction
 from typing import Any, override
 
@@ -151,6 +151,11 @@ SCALE_LOG_FREQ = 2500
 #       (`q_k_target = self.net.qvals(states)` in Agent.py), and that is the version their
 #       published curve came from. Paper-vs-code, not ambiguity; the two differ by up to
 #       TARGET_NETWORK_UPDATE_FREQ steps of staleness. Decide which to follow.
+#       Their version is also the fast one, and by more than anything else on this list: the
+#       online pass already computes q_quants.mean(-2) for policy_entropy, so the log-policy
+#       comes off it for a stop_gradient and the third trunk pass goes. Measured at 22.6 ms
+#       a gradient step against 26.2, -13.8% and the only double-digit saving the profiling
+#       found. Do not take it for the speed -- but it is not a tie-break to leave out either.
 # TODO: NoisyNets' sigma is drifting rather than being learned, and a remedy has to be picked.
 #       Over two full runs, and unmoved by PER_BETA, every NoisyLinear's noisy_sigma_neg_frac
 #       leaves 0 for 0.37-0.48 and its noisy_sigma_signed collapses to zero, while every sigma
@@ -198,14 +203,56 @@ SCALE_LOG_FREQ = 2500
 #   env.step         2.9 ms   host, ALE; it launches nothing, so the inflation misses it
 #   observe          0.3 ms   host: 0.22 ms of it in the buffer's save_step, 0.04 in update_prios
 #   act transfer     0.1 ms   host; the overlap works, this one is free
+#
+# Re-measured 2026-09-18 on the same host with LAYER_NORM on, evaluation and checkpointing off,
+# by perf/bench_loop.py: 2253 env steps/s an iteration of 28.4 ms. Each part timed alone, device
+# under saturation and host after a barrier, so the two columns are what each really costs:
+#   _train_step        25-26 ms device, 12-16 ms host
+#   _act, 64 envs       0.9 ms device,  3.9 ms host
+#   sync_qnet             0 device,     6.7 ms host, before it stopped being jitted
+#   buf.sample                          1.0-2.0 ms host, flat in how full the buffer is
+#   the batch's h2d                     1.2 ms host, obs and next_obs together
+#   env.step, 64 envs                   1.6 ms host
+#   save_step                           0.07 ms host; update_prios 0.006
+# The device is 26.2 ms of the 28.4 and the host, at ~22, has slack -- so every host saving
+# below measured zero on the wall, and only device work is worth cutting. _train_step's device
+# time is its three trunk passes and nothing else: 4.4 ms for the Munchausen target pass on
+# obs, 4.4 for the target on next_obs, 16.7 for the online forward and backward, summing to the
+# whole within 0.5%. The trunk holds ~30 TFLOP/s of bfloat16, about half of what this card does
+# dense, so there is no large kernel-level win left under it either.
+#
+# Gradient steps an iteration against env steps/s, everything else held (perf/sweep.sh):
+#   1 -> 2253     2 -> 1150     4 -> 602     8 -> 294
+# Linear to within 5%, and that 5% is the per-iteration cost amortising rather than slack being
+# taken up: a gradient step costs its own 25 ms of device wherever it lands. A 200M-frame budget
+# is 6.2 h at 1, 12.1 at 2, 23.1 at 4, 47.2 at 8.
+#
+# Evaluation runs nearly always: one 8-episode evaluation on Phoenix outlasted 6250 gradient
+# steps, so both EVAL_FREQ windows inside a 280 s run were skipped, and it is the episode's
+# length that does that -- binding _act below did not change it. What it *costs* the loop is
+# _act's host time, Python holding the GIL against the loop's own dispatch rather than the two
+# contending for the device, and binding the net took 60% of that back:
+#   2133 -> 2206 env steps/s with evaluation on   (Mann-Whitney p = 5e-10 over ~70 windows)
+#   2257 -> 2255 with it off                      (p = 0.72)
+# A 5.5% tax down to 2.2%, and nothing either way in the training loop itself -- which is the
+# whole shape of this block in one measurement: host savings show up only where a thread is
+# host-bound, and the loop is not.
 # Convolutions still carry the device, at ~18% of it, but no longer dominate it; what is left of
 # the idle is the launch-bound tail, 81% of launches under 5 us for 6% of device time. Shrinking
 # that means fewer kernels rather than faster ones, and nothing below has found a way to.
 #
 # Measured and rejected, so they do not get tried twice:
 #   nnx.cached_partial          cuts dispatch Python calls 4x (1.5M -> 369k per 25 steps) and
-#                               does not move wall time; the cost is inside the executable call,
-#                               not the graph traversal.
+#                               does not move wall time -- but not because the traversal is
+#                               cheap, which is what this entry used to say. cProfile puts 81%
+#                               of a _train_step dispatch in nnx's graph flatten/unflatten, and
+#                               binding the same four modules into an equivalent kernel takes
+#                               its host cost 10.4 -> 3.0 ms. The host is simply not what the
+#                               loop waits on. Note for whoever tries it again: _train_step
+#                               takes its modules keyword-only and cached_partial binds only
+#                               positional ones, so it cannot be applied as the signature
+#                               stands. The place it would pay is the evaluator's thread, where
+#                               the same traversal is spent per env step against the GIL.
 #   XLA command buffers         no change, at any --xla_gpu_enable_command_buffer setting.
 #   TF32 matmul precision       JAX_DEFAULT_MATMUL_PRECISION moves dots, not cuDNN's convs,
 #                               which pick their own math type; no change either way.
@@ -329,7 +376,10 @@ SCALE_LOG_FREQ = 2500
 #       XQC's case for it does not apply here: their contrast is against an MSE with unbounded
 #       dL/dy_hat, and the quantile Huber already bounds it by pinball_weight * huber_k <= 1.
 #       What is left is the Hessian structure, and the cost is replacing IQN with C51 outright.
-# TODO: try higher replay ratio + resets; see where BTR breaks on a 3080.
+# TODO: resets, at a higher replay ratio. What the ratio costs is settled -- the performance
+#       block has it, and it is linear -- so the open half is what it buys, and on a 3080 the
+#       budget is what decides: 12 h a run at two gradient steps an iteration, 23 at four.
+#       BBF's 40k cadence is ~21 resets over a 50M-step run.
 # TODO: exploration beyond NoisyNets -- only after a clean baseline reproduces, and neither
 #       candidate is a patch on this loop: NGU needs an R2D2 backbone and BYOL-Explore an RNN
 #       world model. Only NGU's episodic bonus is extractable on its own.
@@ -689,18 +739,24 @@ def _scale_stats(qnet: QNet, opt: nnx.Optimizer[QNet]) -> dict[str, jax.Array]:
     return diagnostic_scales(qnet) | adam_optim_scales(opt, qnet)
 
 
-# Once every TARGET_NETWORK_UPDATE_FREQ steps
-@nnx.jit
 def sync_qnet(qnet: QNet, target_qnet: QNet) -> None:
-    # set_attributes below flips a static attribute, so this compiles once for the
-    # use_running_average=False graphdef (the first call after nnx.clone) and once for the
-    # True one, then hits cache. Verified; not a per-call retrace.
+    """
+    Point ``target_qnet`` at the arrays ``qnet`` holds now.
 
-    # Copy parameters
+    Not jitted, and not a copy: JAX arrays are immutable, so the target keeps what the source
+    held at the call and a later ``opt.update`` cannot reach through the alias. Checked against
+    the jitted copy this replaces -- parameters, the actions the two nets draw, the flags, and
+    SpectralNorm's carried ``u`` under acting.
+
+    It drops 6.7 ms of host a sync, all of it nnx graph traversal for a call that did nothing on
+    the device, and that buys no wall time: 2253 against 2247 env steps/s. The loop is
+    device-bound with host to spare, which is what every host figure in the performance block
+    comes to.
+
+    An alias is what a donated buffer would break, so the donate_argnums the backlog wants has
+    to leave the two nets this hands out of it.
+    """
     nnx.update(target_qnet, nnx.state(qnet))
-
-    # Disable update_stats on SpectralNorm layers
-    target_qnet.set_attributes(use_running_average=True, raise_if_not_found=False)
 
 
 def make_inference_qnet(
@@ -731,7 +787,7 @@ def eval_epsilon_at(num_frames: int) -> float:
 
 
 def _behaviour(
-    qnet: QNet,
+    act: Callable[..., tuple[jax.Array, jax.Array]],
     obs: npt.NDArray[Any],
     rngs: nnx.Rngs,
     *,
@@ -742,6 +798,10 @@ def _behaviour(
     The acting half of both ``BTR`` and ``QNetPolicy``: pick the epsilon this many frames in,
     then draw.
 
+    ``act`` is ``_act`` with its net already bound, not the net, because both callers act with
+    one net for their whole life and binding it is what keeps nnx from walking its 159 nodes
+    again on every env step -- see where they bind it.
+
     The log-probability handed back, which the run logs as ``run/action_log_prob``, is the one
     of the action actually taken, so it is the behaviour policy's own surprise rather than a
     property of the learned q. It is conditional
@@ -749,7 +809,11 @@ def _behaviour(
     see ``_act``. A ceiling on the soft policy's collapse toward argmax, not a measurement of it.
     """
     epsilon = eval_epsilon_at(num_frames) if evaluation else epsilon_at(num_frames)
-    actions, log_probs = _act(qnet, obs, rngs=rngs, epsilon=epsilon)
+    actions, log_probs = act(
+        obs,
+        rngs=rngs,
+        epsilon=epsilon,
+    )
     return actions, {"log_prob": log_probs}
 
 
@@ -767,6 +831,12 @@ class QNetPolicy(Policy):
         self._frames_per_step = frames_per_step
         self._rngs = create_rngs(0)
         self.qnet = make_inference_qnet(num_actions, obs_shape, self._rngs)
+        # The binding caches the walk over this net's graph, not its values: the clone
+        # cached_partial keeps holds the same Variable objects, so ``load`` writing into them
+        # is seen here. It is ``self.qnet`` never being *replaced* that keeps this valid.
+        # Worth 3.8 -> 1.6 ms of host an act, which on the evaluator's thread is that much
+        # less GIL held against the training loop's own dispatch.
+        self._act = nnx.cached_partial(_act, self.qnet)
 
     @override
     def checkpointables(self) -> dict[str, Any]:
@@ -785,7 +855,7 @@ class QNetPolicy(Policy):
         self, obs: npt.NDArray[Any], *, num_env_steps: int, evaluation: bool = False
     ) -> tuple[jax.Array, dict[str, jax.Array]]:
         return _behaviour(
-            self.qnet,
+            self._act,
             obs,
             self._rngs,
             num_frames=num_env_steps * self._frames_per_step,
@@ -830,14 +900,21 @@ class BTR(Agent):
         self.qnet = QNet(
             num_actions, obs_shape=obs_shape, layer_norm=LAYER_NORM, rngs=self.rngs
         )
+        # Neither clone is checkpointed, since sync_qnet rebuilds both from qnet. The flag is
+        # what stops their passes advancing the power iteration outside a gradient step, and
+        # nnx.update writes variables and nothing else, so every later sync leaves it standing
+        # and it is set here once rather than on each of them.
         self.target_qnet = nnx.clone(self.qnet)
-        # Neither clone is checkpointed, since sync_qnet rebuilds both from qnet. The syncs are
-        # not redundant: they are what set use_running_average on the SpectralNorm layers, and
-        # acting on a net without it would advance the training net's power iteration outside
-        # any gradient step.
         self.inference_qnet = nnx.clone(self.qnet)
-        sync_qnet(self.qnet, self.target_qnet)
-        sync_qnet(self.qnet, self.inference_qnet)
+        for net in (self.target_qnet, self.inference_qnet):
+            net.set_attributes(use_running_average=True, raise_if_not_found=False)
+        # As in QNetPolicy: the walk over the acting net's graph is cached here rather than
+        # repeated every iteration, and the sync_qnet writing into that net is seen through it
+        # because both hold the same Variable objects. Only _act can be bound this way --
+        # _train_step's optimizer changes graph structure across opt.update, and it holds qnet,
+        # so neither can be cached without the other. There is nothing to win there anyway;
+        # the performance block says why.
+        self._act = nnx.cached_partial(_act, self.inference_qnet)
 
         self.opt = nnx.Optimizer(
             self.qnet,
@@ -923,7 +1000,7 @@ class BTR(Agent):
     ) -> tuple[jax.Array, dict[str, jax.Array]]:
         """On inference_qnet: acting on qnet would advance its power iteration."""
         return _behaviour(
-            self.inference_qnet,
+            self._act,
             obs,
             self.rngs,
             num_frames=num_env_steps * self._frames_per_step,
