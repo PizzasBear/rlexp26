@@ -21,14 +21,14 @@ type AtariVecEnv = VectorEnv[
 # Two names for one env: the gym id everything is constructed from, and the short one that
 # labels run directories. The id also goes in the hparams, where it is what says which task a
 # curve belongs to.
-ENV_ID = "ALE/Breakout-v5"
-ENV_NAME = "breakout"
+ENV_ID = "ALE/Phoenix-v5"
+ENV_NAME = "phoenix"
 PROTOCOL = dict[str, Any](
     repeat_action_probability=0.25,  # sticky actions (Machado et al. 2018)
     frameskip=4,
     stack_num=4,
     noop_max=30,
-    use_fire_reset=True,
+    use_fire_reset=False,
     episodic_life=False,  # True changes the task; report it if used
     reward_clipping=True,  # clip to [-1, 1] for training
     img_height=84,

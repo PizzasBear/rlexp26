@@ -168,17 +168,51 @@ class ImpalaResSubBlock(nnx.Module):
 
 
 class ImpalaBlock(nnx.Module):
+    """
+    ``spatial`` is the resolution this block is handed, which is also what its convolution
+    writes: the kernel is stride 1 under SAME padding. Only the LayerNorm needs it, and only to
+    size its scale and bias.
+
+    That LayerNorm takes its statistics over channels *and* positions together, one mean and
+    one variance per sample, and learns a scale and a bias per position. Flax spells the second
+    half of that as ``feature_axes``, which it fills by reshaping a flat parameter across the
+    axes named -- hence the ``height * width * out_features`` it is built with. Normalising the
+    map as a whole is what makes a single statistic meaningful across the three blocks, whose
+    resolutions differ by 16x.
+
+    ``epsilon`` is Flax's default 1e-6 and not ``torch.nn.LayerNorm``'s 1e-5, the one place the
+    two libraries disagree to any visible degree: against a PyTorch reference the forward pass
+    and both gradients agree to 1e-5 as it stands, and to 2e-7 were torch's value passed. That is
+    below what this trunk's own bfloat16 rounds away, so it stays a library default rather than
+    becoming a constant to keep matched. Flax's fused ``E[x^2] - E[x]^2`` variance is left alone
+    for the same kind of reason -- it is 3% faster per gradient step and indistinguishable from
+    the two-pass estimator until the mean of a feature map reaches a few hundred times its
+    spread, where this one runs at 0.2.
+    """
+
     def __init__(
         self,
         in_features: int,
         out_features: int,
         *,
+        spatial: tuple[int, int],
         rngs: nnx.Rngs,
+        layer_norm: bool = False,
         dtype: DTypeLike | None = None,
     ) -> None:
         self.conv0 = nnx.Conv(
             in_features, out_features, kernel_size=(3, 3), dtype=dtype, rngs=rngs
         )
+        self.layer_norm0: nnx.LayerNorm | None = nnx.data(None)
+        if layer_norm:
+            height, width = spatial
+            self.layer_norm0 = nnx.LayerNorm(
+                height * width * out_features,
+                reduction_axes=(-3, -2, -1),
+                feature_axes=(-3, -2, -1),
+                dtype=dtype,
+                rngs=rngs,
+            )
         self.res1 = ImpalaResSubBlock(
             out_features, out_features, dtype=dtype, rngs=rngs
         )
@@ -189,13 +223,14 @@ class ImpalaBlock(nnx.Module):
     def __call__(self, x: ArrayLike) -> jax.Array:
         x = jnp.asarray(x)
         x = self.conv0(x)
+        # Before the pool, and nowhere else in the block: the residual pair carries
+        # SpectralNorm and no normalisation of its own.
+        if self.layer_norm0 is not None:
+            x = self.layer_norm0(x)
         x = nnx.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding="SAME")  # type: ignore[no-untyped-call]
         x = self.res1(x)
         x = self.res2(x)
         return x
-
-
-POOLED_SIZE = (6, 6)  # what adaptive_max_pool maps the trunk's spatial dims to
 
 
 class ImpalaCNNLarge(nnx.Module):
@@ -205,8 +240,11 @@ class ImpalaCNNLarge(nnx.Module):
 
     - Parameters are float32 and stay float32. Each convolution casts a copy down for the call,
       so nothing accumulates rounding across steps the way a 16-bit master weight would.
-    - The forward activations through the three blocks are ``dtype``. The trunk casts back
-      before returning, so the head, the loss and the diagnostics never see a 16-bit array.
+    - The forward activations through the three blocks are ``dtype``, and so is what the trunk
+      hands back: casting is the caller's, since a trunk does not know what its features are
+      about to be used for. ``btr.QNet`` casts on the way into the head and ``btr._train_step``
+      on the way into the plasticity diagnostics, so neither the head, the loss nor a diagnostic
+      sees a 16-bit array.
     - The backward pass is ``dtype`` as well: cuDNN accumulates the data and weight gradients in
       float32 internally but writes both out in ``dtype``, so the gradient reaching a float32
       parameter carries only ``dtype``'s precision. Measured against an otherwise identical
@@ -226,16 +264,47 @@ class ImpalaCNNLarge(nnx.Module):
         self,
         in_features: int,
         *,
+        in_spatial: tuple[int, int],
         rngs: nnx.Rngs,
-        size_factor: int,
+        size_factor: int = 1,
+        layer_norm: bool = False,
+        pooled_size: tuple[int, int] = (6, 6),
         dtype: DTypeLike | None = None,
     ) -> None:
         self.size_factor = size_factor
 
         n = self.size_factor
-        self.block0 = ImpalaBlock(in_features, n * 16, dtype=dtype, rngs=rngs)
-        self.block1 = ImpalaBlock(n * 16, n * 32, dtype=dtype, rngs=rngs)
-        self.block2 = ImpalaBlock(n * 32, n * 32, dtype=dtype, rngs=rngs)
+        # Every block closes with a stride-2 SAME-padded pool, which halves each dimension
+        # rounding up, so the resolution the next one's convolution writes is this one's
+        # halved. 84 -> 42 -> 21 for an Atari frame.
+        height, width = in_spatial
+        self.block0 = ImpalaBlock(
+            in_features,
+            n * 16,
+            spatial=(height, width),
+            layer_norm=layer_norm,
+            dtype=dtype,
+            rngs=rngs,
+        )
+        height, width = (height + 1) // 2, (width + 1) // 2
+        self.block1 = ImpalaBlock(
+            n * 16,
+            n * 32,
+            spatial=(height, width),
+            layer_norm=layer_norm,
+            dtype=dtype,
+            rngs=rngs,
+        )
+        height, width = (height + 1) // 2, (width + 1) // 2
+        self.block2 = ImpalaBlock(
+            n * 32,
+            n * 32,
+            spatial=(height, width),
+            layer_norm=layer_norm,
+            dtype=dtype,
+            rngs=rngs,
+        )
+        self.pooled_size = pooled_size
 
     @property
     def out_channels(self) -> int:
@@ -247,7 +316,7 @@ class ImpalaCNNLarge(nnx.Module):
 
     @property
     def out_features(self) -> int:
-        return self.out_channels * POOLED_SIZE[0] * POOLED_SIZE[1]
+        return self.out_channels * self.pooled_size[0] * self.pooled_size[1]
 
     def __call__(self, x: ArrayLike) -> jax.Array:
         x = self.block0(x)
@@ -256,8 +325,8 @@ class ImpalaCNNLarge(nnx.Module):
         # Impala ends its trunk on a ReLU. Order against the pool is irrelevant:
         # relu is monotonic, so max(relu(x)) == relu(max(x)).
         x = nnx.relu(x)
-        x = adaptive_max_pool(x, POOLED_SIZE)
-        return x.reshape(*x.shape[:-3], -1).astype(jnp.float32)
+        x = adaptive_max_pool(x, self.pooled_size)
+        return x.reshape(*x.shape[:-3], -1)
 
 
 class IQNCosineEmbedding(nnx.Module):

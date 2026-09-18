@@ -71,11 +71,13 @@ def play() -> None:
 
     num_actions: int = int(env.action_space.n)
 
-    obs_stack: int = env.observation_space.shape[0]
+    obs_stack, obs_height, obs_width = env.observation_space.shape
     # A policy rather than the agent it was trained by: watching needs the acting weights, and
     # building the rest would allocate a target network and an optimizer for nothing.
     policy: Policy = btr.QNetPolicy(
-        num_actions, obs_stack, frames_per_step=ale.PROTOCOL["frameskip"]
+        num_actions,
+        (obs_stack, obs_height, obs_width),
+        frames_per_step=ale.PROTOCOL["frameskip"],
     )
 
     # Plain defaults, unlike main()'s: this reads a directory a training run may still be writing

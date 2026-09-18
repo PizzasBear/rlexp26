@@ -5,7 +5,7 @@ import signal
 import time
 from argparse import ArgumentParser
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, closing, contextmanager
 from types import FrameType
 from typing import Any, NamedTuple
@@ -25,12 +25,11 @@ from .evaluate import EvalResult, Evaluator
 SEED = 0
 EVAL_SEED = SEED + 1  # fixed, so every evaluation replays the same no-op starts
 NUM_ENVS = 64  # environments stepped in lockstep, and the loop's batch of actions
-LOG_FREQ = 25  # env-loop iterations between rate/throughput writes
-TRAIN_LOG_FREQ = 25  # gradient steps between train_step diagnostic writes
+LOG_FREQ = 100  # env-loop iterations between rate/throughput writes
 CHECKPOINT_FREQ = 3125  # gradient steps between checkpoints
 CHECKPOINT_KEEP = 3  # checkpoints kept on disk; the rest are garbage collected
 EVAL_FREQ = 3125  # gradient steps between evaluation runs
-STATS_QUEUE_LEN = 3
+STATS_DRAIN_LAG = 2  # env-loop iterations a gradient step's diagnostics stay in flight
 
 
 @contextmanager
@@ -64,11 +63,47 @@ def interruptible() -> Generator[Callable[[], bool]]:
         signal.signal(signal.SIGINT, previous)
 
 
+class SinceLastSavePolicy:
+    """
+    Save once ``interval`` gradient steps have passed since the newest checkpoint, and never
+    while a save is still writing. Orbax's ``SaveDecisionPolicy`` is a runtime-checkable
+    protocol, so this satisfies it by shape rather than by inheritance.
+
+    Orbax's ``FixedIntervalPolicy`` tests ``step % interval`` instead, which an agent taking
+    several gradient steps an iteration -- a replay ratio above one step per iteration -- steps
+    over rather than lands on, and at an even number of steps an iteration it would never save
+    at all. The evaluation below is paced by the same kind of window for the same reason.
+
+    Skipping the save while one is in progress is what keeps the loop off the disk: dropping a
+    checkpoint costs nothing, blocking on the write costs a step. With nothing on disk yet there
+    is no interval to measure, so the first step asked about is saved -- orbax's own
+    ``InitialSavePolicy`` behaviour, and it puts something resumable on disk before an interval
+    has passed.
+    """
+
+    def __init__(self, interval: int) -> None:
+        self.interval = interval
+
+    def should_save(
+        self,
+        step: ocp.training.CheckpointMetadata[Any],
+        previous_steps: Sequence[ocp.training.CheckpointMetadata[Any]],
+        *,
+        context: ocp.training.save_decision_policies.DecisionContext,
+    ) -> bool:
+        if context.is_saving_in_progress:
+            return False
+        return (
+            not previous_steps or self.interval <= step.step - previous_steps[-1].step
+        )
+
+
 class PendingStats(NamedTuple):
     """
-    One gradient step's diagnostics, still in flight on the device. Draining them on the *next*
-    iteration is what lets the step overlap ``env.step``; the counter travels with them so they
-    land on the curve where they were computed rather than where they were read.
+    One gradient step's diagnostics, still in flight on the device. Leaving them there for
+    STATS_DRAIN_LAG iterations is what lets the step overlap ``env.step``; the counter travels
+    with them so they land on the curve where they were computed rather than where they were
+    read, and it is what the drain measures their age in.
     """
 
     values: dict[str, jax.Array]
@@ -153,12 +188,12 @@ def main() -> None:
         num_actions: int = env.action_space.nvec[0]
         assert (env.action_space.nvec == num_actions).all()
 
-        obs_stack: int = env.single_observation_space.shape[0]
+        obs_stack, obs_height, obs_width = env.single_observation_space.shape
         # The one place the algorithm is named. Everything below asks the agent what it needs
         # rather than reaching into it.
         agent: Agent = btr.BTR(
             num_actions,
-            obs_stack,
+            (obs_stack, obs_height, obs_width),
             frames_per_step=ale.FRAMES_PER_STEP,
             seed=SEED,
         )
@@ -177,17 +212,14 @@ def main() -> None:
         # a tmp directory and renamed on completion, so an interrupt cannot destroy what is
         # already on disk the way an overwrite-in-place would.
         #
-        # The pyright ignores are upstream's annotations, not these arguments: orbax types both
-        # parameters against its v1 protocols, which its own v0 policy classes do not nominally
+        # The pyright ignore is upstream's annotation, not this argument: orbax types the
+        # parameter against its v1 protocol, which its own v0 policy classes do not nominally
         # satisfy.
-        save_policy = ocp.training.save_decision_policies.FixedIntervalPolicy(
-            CHECKPOINT_FREQ
-        )
         keep_policy = ocp.training.preservation_policies.LatestN(CHECKPOINT_KEEP)
         ckptr: ocp.training.Checkpointer = stack.enter_context(
             ocp.training.Checkpointer(
                 run_dir,
-                save_decision_policy=save_policy,  # pyright: ignore[reportArgumentType]
+                save_decision_policy=SinceLastSavePolicy(CHECKPOINT_FREQ),
                 preservation_policy=keep_policy,  # pyright: ignore[reportArgumentType]
                 cleanup_tmp_directories=True,
             )
@@ -225,9 +257,9 @@ def main() -> None:
 
         stats_queue = deque[PendingStats]()
         num_updates = agent.num_updates
-        # Windows rather than modulo tests on num_updates, which an agent that learns in batches
-        # steps over rather than landing on.
-        last_train_log_updates = last_eval_updates = num_updates
+        # A window rather than a modulo test on num_updates, which an agent that learns in
+        # batches steps over rather than landing on.
+        last_eval_updates = num_updates
         log_every_env_steps = LOG_FREQ * env.num_envs
         # Not checkpointed: the returns run into episodes a resumed run abandons at the env.reset
         # above, and the rate is measured from wherever this process started.
@@ -243,15 +275,19 @@ def main() -> None:
         last_eval: EvalResult | None = None
         last_training_returns: float | None = None
 
-        def drain_stats(keep: int) -> None:
+        def drain_stats(lag: int) -> None:
             """
-            Write the finished gradient steps' diagnostics, leaving ``keep`` still in flight.
+            Write the diagnostics of every gradient step dispatched at least ``lag`` iterations
+            ago; a shutdown passes 0.
 
-            The loop leaves STATS_QUEUE_LEN - 1 outstanding so that a transfer never waits on the
-            device; a shutdown leaves none, or the last steps before a checkpoint would be the
-            ones missing from the curve.
+            Iterations rather than a queue depth, because entries arrive on the agent's logging
+            cadence and can be a hundred apart. A step dispatched in iteration i is still running
+            through i + 1 -- the foot of the loop waits only on the act before it -- and is
+            necessarily done by i + 2, since the act dispatched after it has been waited on.
             """
-            while keep < len(stats_queue):
+            while stats_queue and (
+                lag * env.num_envs <= num_env_steps - stats_queue[0].env_steps
+            ):
                 stats = stats_queue.popleft()
                 for name, value in jax.device_get(stats.values).items():
                     writer.add_scalar(name, float(value), global_step=stats.env_steps)
@@ -376,9 +412,8 @@ def main() -> None:
                 )
                 curr_returns[done] = 0.0
 
-            # Drained here, and only here until shutdown: the GPU has had the whole of
-            # env.step to finish the step that produced them.
-            drain_stats(STATS_QUEUE_LEN - 1)
+            # Drained here, and only here until shutdown.
+            drain_stats(STATS_DRAIN_LAG)
 
             with jax.profiler.TraceAnnotation("agent.observe"):
                 agent.observe(
@@ -446,9 +481,9 @@ def main() -> None:
                 if profile_count and profile_at is None:
                     profile_at = num_updates + profile_start
 
-                # Only the logging iterations pay a transfer for the scalars.
-                if num_updates - last_train_log_updates >= TRAIN_LOG_FREQ:
-                    last_train_log_updates = num_updates
+                # The agent reports on its own cadence and hands back nothing on the steps
+                # between, so only the steps it means to write pay a transfer.
+                if learn_stats:
                     jax.copy_to_host_async(learn_stats)  # type: ignore[no-untyped-call]
                     stats_queue.append(
                         PendingStats(values=learn_stats, env_steps=num_env_steps)

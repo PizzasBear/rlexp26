@@ -136,8 +136,10 @@ class Agent(ABC):
         whole pass over a rollout for an agent that learns in batches.
 
         Returns how many gradient steps this call took -- zero being the signal that there was
-        nothing to do -- and the scalars to log, keyed by scalar name. The scalars are still on
-        the device: the run transfers only the ones it means to write.
+        nothing to do -- and the scalars to log for it, keyed by scalar name, empty on a step the
+        agent does not report on. The cadence is the agent's because the cost of producing a
+        diagnostic is: some are free beside the step and some are most of an event file. The
+        scalars are still on the device, and the run transfers whatever it is handed.
         """
 
     @abstractmethod
