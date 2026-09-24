@@ -14,31 +14,24 @@ pub enum UpdateError {
 #[error("Sample larger than tree size")]
 pub struct SampleError(());
 
-/// A sum-tree over `len` priorities, supporting O(log n) point update and O(log n) sampling
+/// A sum tree over `len` priorities, with O(log n) point update and O(log n) sampling
 /// proportional to priority.
 ///
-/// This is implemented as a Segment-Tree. While I considered using a Fenwick-Tree instead, I
-/// realised the floating point errors would probably stack on top of each other. That intuition
-/// holds up for a concrete reason: every internal node here is *re-derived* from its two children
-/// on each update rather than adjusted by a delta, which makes the total a pairwise summation
-/// whose relative error stays around `log2(len) * f32::EPSILON` no matter how many updates have
-/// been applied. A Fenwick tree cannot re-derive like that -- it can only add the difference into
-/// each covering node -- so its error really would accumulate without bound over a long run.
+/// A segment tree, not a Fenwick tree: every internal node is re-derived from its two children
+/// on update rather than adjusted by a delta, so the total's relative error stays around
+/// `log2(len) * f32::EPSILON` however many updates go through it.
 ///
 /// # Layout
 ///
 /// `data` is an implicit binary heap of `2 * len - 1` nodes: the root is `0`, the children of `i`
-/// are `2i + 1` and `2i + 2`, and each node holds the sum of its subtree. Since the length is
-/// odd, node `i` has children exactly when `2i + 1 < data.len()`, i.e. when `i < offset()`, so the
-/// last `len` nodes are the leaves and hold the priorities in order. This works for any `len`, not
-/// only powers of two, and every non-root node has a sibling.
+/// are `2i + 1` and `2i + 2`, and each node holds its subtree's sum. The length is odd, so node
+/// `i` has children exactly when `i < offset()`, and the last `len` nodes are the leaves, in
+/// order. This works for any `len`.
 ///
 /// # Sampling invariant
 ///
-/// [`sample`](Self::sample) descends maintaining `sample < subtree total`. That is what guarantees
-/// it lands on a leaf with a *non-zero* priority, and it is why the accepted range is the
-/// half-open `[0, total)` -- passing `total` itself would break the invariant at the first step
-/// and could return an unset leaf.
+/// [`sample`](Self::sample) descends maintaining `sample < subtree total`, which keeps it off
+/// zero-priority leaves. Hence the half-open `[0, total)`.
 pub struct PrioTree {
     data: Box<[f32]>,
 }
@@ -101,13 +94,11 @@ impl PrioTree {
         Ok(())
     }
 
-    /// Maps a point in `[0, total())` to the index whose priority interval contains it, returning
-    /// that index and its priority. Feeding this uniform noise samples proportional to priority.
+    /// Maps a point in `[0, total())` to the index whose priority interval contains it, and that
+    /// index's priority. Uniform points sample proportionally to priority.
     ///
-    /// The half-open range is what keeps the descent off a zero-priority leaf, and it survives the
-    /// rounding in the node totals: a `f32` strictly below a node's stored total is a full gap
-    /// below it, which is at least as wide as half an ulp of either child, so `sample - left` can
-    /// never round up as far as the right child's own total.
+    /// The invariant survives rounding in the node totals: a point strictly below a node's total
+    /// is at least an ulp below it, so `sample - left` cannot round up to the right child's total.
     pub fn sample(&self, mut sample: f32) -> Result<(usize, f32), SampleError> {
         if self.total() == 0.0 || !(0.0 <= sample && sample < self.total()) {
             return Err(SampleError(()));

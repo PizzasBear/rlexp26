@@ -2,62 +2,35 @@
 //!
 //! # Storage layout
 //!
-//! Every array is indexed `[env, slot, ..]`, where each of the `num_envs` environments owns an
-//! independent circular buffer of `env_capacity` slots. Transitions are addressed from Python by
-//! the flat index `env * env_capacity + slot`, which is what [`ReplayBuffer::sample`] returns and
-//! what [`ReplayBuffer::update_prios`] expects back. That index is a `u32`, so the constructor
-//! rejects a `num_envs * env_capacity` that would not fit in one.
+//! Every array is `[env, slot, ..]`: each of `num_envs` environments owns a circular buffer of
+//! `env_capacity` slots. Python addresses a transition by the `u32` flat index
+//! `env * env_capacity + slot`, which [`ReplayBuffer::sample`] returns and
+//! [`ReplayBuffer::update_prios`] takes back.
 //!
-//! Successor observations are not stored. The transition at slot `i` reads its `next_obs` from
-//! slot `i + 1` of the same environment, and frame stacks read backwards from `i` the same way.
-//! This halves the memory an Atari-sized buffer needs, at the cost of making a window of slots
-//! around each environment's write head unsamplable: the head itself has no successor yet, and
-//! `obs_stack` and `n_steps` widen that window in either direction.
+//! Successor observations are not stored: slot `i` reads its `next_obs` from slot `i + 1`, and a
+//! frame stack reads backwards from `i`. That halves the memory, at the cost of an unsamplable
+//! window around each write head, widened by `obs_stack` and `n_steps`.
 //!
 //! # Episode boundaries
 //!
-//! Boundaries are inferred from the `terminated` and `truncated` flags of each
-//! [`ReplayBuffer::save_step`], under Gymnasium's default `AutoresetMode.NEXT_STEP`: the step that
-//! ends an episode returns that episode's *final* observation, and the call after it returns the
-//! new episode's first observation together with an action and a reward that the environment
-//! ignored. This buffer follows the same shape. The terminating step stores its transition and
-//! parks the final observation in the slot after it -- that slot never gets an action, so it is
-//! never sampled -- and the autoreset call that follows completes no transition at all; its
-//! placeholder action and reward are overwritten in place by the next real step.
-//!
-//! [`ReplayBuffer::reset`] is for the opening observation and for abandoning an episode by hand.
-//! It is not needed at autoreset boundaries, and calling it there is harmless.
+//! Boundaries come from [`ReplayBuffer::save_step`]'s `terminated` and `truncated` flags, under
+//! Gymnasium's default `AutoresetMode.NEXT_STEP`. The terminating step stores its transition and
+//! parks the episode's final observation in the next slot, which never gets an action. The call
+//! after it carries the new episode's first observation and completes no transition; its
+//! placeholder action and reward are overwritten by the next step. [`ReplayBuffer::reset`] is
+//! only for the opening observation and for abandoning an episode by hand.
 //!
 //! # Frame stacks
 //!
-//! `obs_stack` is a property of the model rather than of a draw, so it is fixed at construction:
-//! [`ReplayBuffer::sample`] returns that many consecutive frames per observation, on an axis just
-//! after the batch. Only one frame per slot is ever stored -- the rest of a stack is already in
-//! the slots before it -- so [`ReplayBuffer::save_step`] takes either a single new frame or the
-//! environment's whole stacked observation, `(num_envs, obs_stack, *obs_shape)`, and keeps only
-//! the newest frame of it. See [`obs_frame`]. `n_steps`, by contrast, is a per-draw argument,
-//! since it is the kind of thing a schedule moves during training.
-//!
-//! Frames lead rather than trail so that each one is a contiguous run of bytes on both paths:
-//! `save_step` picks its frame out with a memcpy per environment instead of a stride-`obs_stack`
-//! byte scatter, and `sample` builds a stack as `obs_stack` back-to-back memcpys. A model wanting
-//! frames trailing should transpose on the accelerator, where that move is cheap and is usually
-//! folded into the first layer.
+//! `obs_stack` is fixed at construction and `n_steps` chosen per draw. One frame is stored per
+//! slot, and [`ReplayBuffer::sample`] reassembles the stack; see `obs_frame`.
 //!
 //! # Priorities
 //!
-//! Sampling is proportional to the values most recently passed to [`ReplayBuffer::update_prios`],
-//! and no exponent is applied to them on the way in. A caller wanting the usual `p ** alpha`
-//! weighting therefore applies `alpha` before calling. Note that `alpha` genuinely cannot be
-//! applied after the fact: the tree samples in proportion to whatever it stores, so raising the
-//! priorities to a power afterwards would not change the distribution that produced the batch.
-//!
-//! [`ReplayBuffer::sample`] hands those stored priorities straight back rather than normalising
-//! them. Which denominator an importance-sampling weight should use is the caller's decision, not
-//! this buffer's -- [`sum_prios`](ReplayBuffer::sum_prios) gives the sampling probability,
-//! [`max_prio`](ReplayBuffer::max_prio) a weight scaled against the whole buffer rather than
-//! against one batch -- and a normalised number cannot be taken back apart. That keeps `beta` on
-//! the caller's side along with `alpha`.
+//! Sampling is proportional to the values last passed to [`ReplayBuffer::update_prios`], so a
+//! caller wanting `p ** alpha` applies `alpha` first. [`ReplayBuffer::sample`] returns the stored
+//! priorities unnormalised, leaving the importance-sampling denominator, and `beta`, to the
+//! caller.
 
 use std::{borrow::Cow, num::NonZero, ops::RangeInclusive};
 
@@ -76,12 +49,11 @@ use crate::dyn_array::{DType, DynArray, DynArrayView, dyn_gather, dyn_write_batc
 use crate::prio_tree::PrioTree;
 use crate::utils::{AllocationError, try_zeroed_vec, write_batch};
 
-/// How an episode continues past a slot, kept per slot so that sampling can tell a real episode
-/// end from a time limit and can avoid stacking frames across a boundary.
+/// How an episode continues past a slot, so that sampling can tell an episode end from a time
+/// limit and keep frame stacks inside an episode.
 ///
-/// Between calls an environment's write head always sits on a [`Reset`](Self::Reset) or a
-/// [`Final`](Self::Final) slot; the remaining variants mark slots whose transition is complete,
-/// and only those are ever samplable.
+/// Between calls a write head always sits on a [`Reset`](Self::Reset) or [`Final`](Self::Final)
+/// slot. Only the other three are complete transitions, and only they are samplable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum SlotType {
@@ -126,11 +98,8 @@ pub struct Batch {
     pub next_obs: DynArray,
 }
 
-/// Everything [`ReplayBuffer`] rejects a call for.
-///
-/// The variants are split by what kind of mistake they represent rather than by which method
-/// raised them, so that the Python boundary can map each onto the exception a caller expects
-/// without knowing where it came from; see the `From<ReplayBufferError>` the `pyffi` module adds.
+/// Everything [`ReplayBuffer`] rejects a call for, split by kind of mistake rather than by method,
+/// so that `pyffi` can map each onto a Python exception.
 #[derive(Error, Debug)]
 pub enum ReplayBufferError {
     #[error("{0}")]
@@ -170,11 +139,8 @@ impl ReplayBufferError {
 
 pub type ReplayBufferResult<T> = Result<T, ReplayBufferError>;
 
-/// How a [`ReplayBuffer`] is to be built.
-///
-/// The fields are private and the `with_*` methods are the only way to set them, so that there is
-/// one construction path to validate rather than a struct literal that can also be written by
-/// hand. [`ReplayBuffer::new`] takes it by reference and reads it directly.
+/// How a [`ReplayBuffer`] is to be built. Set only through the `with_*` methods, so there is one
+/// construction path to validate.
 #[derive(Debug, Clone, Copy)]
 pub struct ReplayBufferSpec<'a> {
     obs_shape: &'a [usize],
@@ -241,8 +207,7 @@ impl<'a> ReplayBufferSpec<'a> {
     }
 }
 
-/// What one call to [`ReplayBuffer::sample`] asks for. Private fields for the reason
-/// [`ReplayBufferSpec`]'s are private.
+/// What one call to [`ReplayBuffer::sample`] asks for, set like [`ReplayBufferSpec`].
 #[derive(Clone, Copy, Debug)]
 pub struct ReplayBufferSampleParams {
     n_steps: NonZero<u32>,
@@ -267,11 +232,8 @@ impl ReplayBufferSampleParams {
         self
     }
 
-    /// The factor a rollout actually discounts by.
-    ///
-    /// An unset `discount` means one step per draw and so nothing to discount;
-    /// [`ReplayBuffer::sample`] rejects a multi-step draw that left it unset rather than quietly
-    /// accumulating an undiscounted return.
+    /// The factor a rollout discounts by: 1 when `discount` is unset, which
+    /// [`ReplayBuffer::sample`] allows only for one-step draws.
     pub const fn discount_or_one(&self) -> f32 {
         match self.discount {
             Some(discount) => discount,
@@ -286,8 +248,7 @@ impl Default for ReplayBufferSampleParams {
     }
 }
 
-/// Rejects a `max_prio_decay` outside `(0, 1]`. Shared by the constructor and the setter, which
-/// have to agree: a value the setter refuses must not be reachable by building a buffer with it.
+/// Rejects a `max_prio_decay` outside `(0, 1]`, for the constructor and the setter alike.
 fn check_max_prio_decay(max_prio_decay: f32) -> ReplayBufferResult<()> {
     if !(0.0 < max_prio_decay && max_prio_decay <= 1.0) {
         return Err(ReplayBufferError::invalid_argument(
@@ -298,8 +259,7 @@ fn check_max_prio_decay(max_prio_decay: f32) -> ReplayBufferResult<()> {
     Ok(())
 }
 
-/// Rejects `stratified` on a buffer with no priorities. Shared by the constructor and the setter
-/// for the same reason [`check_max_prio_decay`] is.
+/// Rejects `stratified` on a buffer with no priorities, for the constructor and the setter alike.
 fn check_stratified(stratified: bool, use_prios: bool) -> ReplayBufferResult<()> {
     if stratified && !use_prios {
         return Err(ReplayBufferError::requires_priorities(
@@ -324,27 +284,13 @@ fn check_batch_shape(name: &str, batch: &[usize], array: &[usize]) -> ReplayBuff
     Ok(())
 }
 
-/// Picks the single frame that [`ReplayBuffer::reset`] and [`ReplayBuffer::save_step`] store out of
-/// a batch of observations.
+/// Picks the frame [`ReplayBuffer::reset`] and [`ReplayBuffer::save_step`] store out of a batch of
+/// observations: `(num_envs, *obs_shape)` as it stands or, with `obs_stack` set, the newest (last)
+/// frame of `(num_envs, obs_stack, *obs_shape)`, as Gymnasium's `FrameStackObservation` and ALE's
+/// `stack_num` order them. The earlier frames are already in the slots before this one.
 ///
-/// Without `obs_stack` the batch is one frame per environment, `(num_envs, *obs_shape)`, and is
-/// stored as it stands. With `obs_stack` set the caller may hand over either that same single
-/// frame -- having already picked the new one out of whatever the environment returned -- or the
-/// environment's whole stacked observation, `(num_envs, obs_stack, *obs_shape)`, of which only the
-/// newest frame is kept. The newest frame is the last along the stack axis, which is the
-/// convention both Gymnasium's `FrameStackObservation` and ALE's own `stack_num` follow.
-///
-/// Storing only that frame is the point of the whole layout: the earlier frames of the stack are
-/// already in the buffer, in the slots before this one, so keeping the stack as handed over would
-/// multiply the buffer's memory by `obs_stack` for nothing. [`ReplayBuffer::sample`] reassembles
-/// it on the way out.
-///
-/// The stack axis comes *before* the frame rather than after it so that the frame this picks out is
-/// one contiguous run of bytes. Taking it from a trailing stack axis would instead read every byte
-/// at a stride of `obs_stack`, turning what should be one memcpy per environment into a scattered
-/// per-byte copy touching `obs_stack` times as many cache lines -- on every `save_step`. A model
-/// wanting the frames trailing should transpose on the accelerator, where the move costs bandwidth
-/// this copy cannot match and is usually folded into the first layer.
+/// The stack axis leads so that the frame is contiguous: one memcpy per environment, not a
+/// stride-`obs_stack` scatter.
 fn obs_frame<'a>(
     name: &'static str,
     batch: DynArrayView<'a>,
@@ -382,24 +328,15 @@ fn obs_frame<'a>(
 /// The ages a draw may land on in an environment that has written `len` slots, or `None` when it
 /// cannot serve one yet.
 ///
-/// Ages count back from the write head: age 0 is the head, age 1 the transition completed most
-/// recently. Complete transitions sit at ages `1 ..= len` and the oldest observation at age `len`
-/// -- one further back than the oldest transition, since the head's observation is the previous
-/// transition's `next_obs` -- so `obs_len` below is `len + 1`, clamped to `capacity`.
+/// Ages count back from the write head: age 0 is the head, age 1 the newest complete transition.
+/// The oldest observation sits at age `len`, or `capacity - 1` once full, since the head's
+/// observation is the previous transition's `next_obs`. A draw at age `a` reads its stack back
+/// over `a ..= a + obs_stack - 1`, which must not pass the oldest observation, and its rollout
+/// forward over `a ..= a - n_steps + 1`, which must stay on complete transitions, so
+/// `a >= n_steps`. The rollout's `next_obs` may be the head itself.
 ///
-/// That is a bound on the oldest age, not a count of observations, and the two part company for
-/// one call after an episode ends: the head is then an empty `Reset` slot, so there are `len`
-/// observations, at ages `1 ..= len`, with age 0 holding nothing. The bound is unaffected, since
-/// the oldest age is `len` either way, and nothing ever reads the empty age 0. A rollout could
-/// only end there starting from age `n_steps`, which means walking through age 1 -- and with the
-/// head on a `Reset` slot, age 1 is the observation the ended episode was parked on and age 2 the
-/// transition that ended it, which [`ReplayBuffer::rollout`] stops at before it gets there.
-///
-/// A draw at age `a` needs two things. Its frame stack reads backwards, ages
-/// `a ..= a + obs_stack - 1`, which must stay inside the written observations rather than wrapping
-/// past the oldest one onto the newest. Its rollout reads forwards, ages `a ..= a - n_steps + 1`,
-/// which must stay on complete transitions, so `a >= n_steps`. The `next_obs` the rollout ends on
-/// may be the head itself, at age 0, which is exactly what that observation is there for.
+/// After an episode ends the head is an empty `Reset` slot, so age 0 holds nothing; a rollout
+/// never reaches it, since [`ReplayBuffer::rollout`] stops at the parked observation at age 1.
 fn valid_ages(
     len: u32,
     capacity: u32,
@@ -419,19 +356,16 @@ pub struct ReplayBuffer {
     /// slots. Also lets [`ReplayBuffer::save_step`] accept an environment's stacked observation and
     /// keep only its newest frame; see [`obs_frame`].
     obs_stack: Option<NonZero<u32>>,
-    /// Whether [`ReplayBuffer::sample`] spreads a prioritised batch over the priority mass rather
-    /// than drawing each element independently. Only ever true alongside `prios`
+    /// Whether [`ReplayBuffer::sample`] spreads a prioritised batch over the priority mass. Only
+    /// ever true alongside `prios`.
     stratified: bool,
 
     /// Per environment: the slot the next observation is written to.
     env_heads: Box<[u32]>,
     /// Per environment: how many of its slots have been written, saturating at `env_capacity`.
     env_lens: Box<[u32]>,
-    /// Scratch: the slot each environment's incoming observation goes into, as the boundary state
-    /// machine chooses it. Both write paths are the same shape -- run the state machine once per
-    /// environment, then write one observation per environment into the slot it picked -- and this
-    /// carries the first half of that to the second. On the struct only to keep a per-step
-    /// allocation out of the write path.
+    /// Scratch between the write path's two passes: the slot each environment's incoming
+    /// observation goes to. On the struct to keep an allocation out of every step.
     obs_slots: Box<[u32]>,
 
     observations: DynArray,
@@ -491,10 +425,8 @@ impl ReplayBuffer {
             ));
         }
 
-        // The starting `max_prio` is held to the rule a priority is held to in `update_prios`,
-        // since it is the same quantity, seeded rather than computed. Zero is therefore allowed,
-        // and means new transitions stay unsamplable until something writes a priority. Unlike
-        // `max_prio_decay` there is no setter to keep in agreement, so this is checked inline.
+        // Held to the rule a priority is held to in `update_prios`. Zero leaves new transitions
+        // unsamplable until a priority is written.
         if !spec.max_prio.is_finite() || spec.max_prio < 0.0 {
             return Err(ReplayBufferError::invalid_argument(format!(
                 "max_prio {} must be finite and non-negative",
@@ -504,10 +436,6 @@ impl ReplayBuffer {
 
         check_max_prio_decay(spec.max_prio_decay)?;
 
-        // Stratification slices the *priority* mass, so without priorities there is nothing for
-        // it to mean: a uniform draw already spreads evenly over every samplable transition.
-        // Refusing it beats accepting and ignoring it, which would leave a caller believing a
-        // variance reduction was in effect that never was.
         let stratified = spec.stratified.unwrap_or(spec.use_prios);
         check_stratified(stratified, spec.use_prios)?;
 
@@ -532,8 +460,7 @@ impl ReplayBuffer {
         act_shape.push(env_capacity as _);
         act_shape.extend_from_slice(spec.act_shape);
 
-        // `len` is `num_envs * env_capacity`, checked above, so neither per-slot table below can
-        // reject the buffer it is handed.
+        // `len` was checked above, so neither table can reject its shape.
         let table_shape = (num_envs.get() as usize, env_capacity as usize);
 
         Ok(Self {
@@ -562,20 +489,15 @@ impl ReplayBuffer {
         })
     }
 
-    // What the buffer holds. `len` counts everything written, including the window around
-    // each write head that `sample` will not draw from.
+    // What the buffer holds.
 
-    /// Number of transitions currently stored, summed across environments.
-    ///
-    /// This counts everything written, which is not the same as the number of transitions that
-    /// [`sample`](Self::sample) can actually draw -- the write-head window described in the module
-    /// docs is excluded from sampling but included here.
+    /// Transitions written, summed across environments. Includes the unsamplable window around
+    /// each write head, so it is more than [`sample`](Self::sample) can draw.
     pub fn len(&self) -> usize {
         self.env_lens.iter().sum::<u32>() as _
     }
 
-    /// Whether nothing has been written yet. A buffer is empty until its first
-    /// [`reset`](Self::reset) or [`save_step`](Self::save_step), and never again.
+    /// Whether nothing has been written yet.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -617,11 +539,8 @@ impl ReplayBuffer {
     }
 
     /// Whether a prioritised batch is spread over the priority mass rather than drawn
-    /// independently. Settable: it changes only the draws' correlation, never what is stored, so
-    /// there is nothing to keep consistent across a change.
-    ///
-    /// Setting it on a buffer built without priorities is a
-    /// [`RequiresPriorities`](ReplayBufferError::RequiresPriorities).
+    /// independently. Settable, since it changes how draws correlate and nothing stored; setting
+    /// it without priorities is a [`RequiresPriorities`](ReplayBufferError::RequiresPriorities).
     pub fn stratified(&self) -> bool {
         self.stratified
     }
@@ -633,25 +552,17 @@ impl ReplayBuffer {
         Ok(())
     }
 
-    /// The priority a newly written transition is given, per
-    /// [`update_prios`](Self::update_prios).
+    /// The priority a newly written transition is given, per [`update_prios`](Self::update_prios),
+    /// and so the scale of a buffer-wide importance-sampling weight.
     ///
-    /// This is the scale [`sample`](Self::sample)'s priorities are drawn against, so an
-    /// importance-sampling correction that normalises against the whole buffer rather than the
-    /// batch reads it from here.
-    ///
-    /// Its starting value is a [`ReplayBufferSpec`] field -- a run resuming from a checkpoint
-    /// carries it across, so that the transitions its refilled buffer writes are not all handed
-    /// the priority of a fresh one -- but there is no setter, unlike
-    /// [`max_prio_decay`](Self::max_prio_decay). Every priority already written was written
-    /// against some value of this one, and moving it mid-run silently reweights new transitions
-    /// against transitions that were new under the old scale.
+    /// Its starting value is a [`ReplayBufferSpec`] field, so a resumed run can carry it. There is
+    /// no setter: every stored priority was written against the value in force at the time.
     pub fn max_prio(&self) -> f32 {
         self.max_prio
     }
 
-    /// How fast [`max_prio`](Self::max_prio) decays, per `update_prios` call. Settable, so that a
-    /// schedule can track a changing replay ratio -- the half-life is measured in gradient steps.
+    /// How fast [`max_prio`](Self::max_prio) decays, once per `update_prios` call, so its
+    /// half-life is in gradient steps. Settable.
     pub fn max_prio_decay(&self) -> f32 {
         self.max_prio_decay
     }
@@ -663,10 +574,8 @@ impl ReplayBuffer {
         Ok(())
     }
 
-    // Slot bookkeeping: the primitives the write and read paths below both move. Nothing outside
-    // this file ever writes `types` or the priority tree, which is what the `unreachable!` arms in
-    // `reset` and `save_step` rest on -- between calls a head slot is always `Reset` or `Final`,
-    // because no other code puts anything there.
+    // Slot bookkeeping, for both paths. Nothing outside this file writes `types` or the priority
+    // tree, which is what the `unreachable!` arms in `reset` and `save_step` rest on.
 
     /// The type of one stored slot.
     #[inline]
@@ -679,12 +588,8 @@ impl ReplayBuffer {
         self.types[[env, slot as usize]] = ty as _;
     }
 
-    /// Sets a slot's sampling weight.
-    ///
-    /// Slots that do not hold a complete transition are given zero, which is what keeps
-    /// [`PrioTree::sample`] from ever returning them. Doing so is not merely tidiness: once the
-    /// buffer has wrapped, a slot arrives at the head still carrying the priority it was given on
-    /// the previous lap, and leaving that in place would make the write head samplable.
+    /// Sets a slot's sampling weight. Slots without a complete transition get zero, which keeps
+    /// [`PrioTree::sample`] off them; a recycled slot reaches the head still carrying last lap's.
     fn set_slot_prio(&mut self, env: usize, slot: u32, prio: f32) {
         let index = env * self.env_capacity() + slot as usize;
         if let Some(prios) = self.prios.as_mut() {
@@ -727,50 +632,31 @@ impl ReplayBuffer {
         (self.env_heads[env] + capacity - slot) % capacity
     }
 
-    // The write path, and the episode-boundary state machine that runs inside it. Both of these
-    // are two passes over the environments on purpose: the first walks the state machine one
-    // environment at a time and records the slot that call's incoming observation lands in, and
-    // only then does the second write every observation in a single batched copy. `obs_slots`
-    // carries the first pass's answer to the second.
+    // The write path. Both calls run the boundary state machine one environment at a time,
+    // recording each incoming observation's slot in `obs_slots`, then write every observation in
+    // one batched copy.
 
     /// Seeds every environment with its initial observation.
     ///
-    /// `obs` is indexed by environment -- shape `(num_envs, *obs_shape)`, or
-    /// `(num_envs, obs_stack, *obs_shape)` where the buffer has a frame stack, in which case only
-    /// the newest frame is kept. It must already be in the dtype the buffer was built with;
-    /// nothing is cast on the way in.
+    /// `obs` is `(num_envs, *obs_shape)`, or `(num_envs, obs_stack, *obs_shape)` of which only the
+    /// newest frame is kept, and already in the buffer's dtype. Normally called once: autoreset boundaries come from `save_step`'s flags.
+    /// Called mid-run it abandons the current episode, as `gym.Env.reset` does.
     ///
-    /// Normally called once, before the first [`save_step`](Self::save_step): autoreset boundaries
-    /// during play are inferred from the `terminated` and `truncated` flags rather than from
-    /// further `reset` calls. Calling it again mid-run is still well defined, and means what
-    /// `gym.Env.reset` means -- abandon the current episode and start a new one.
+    /// The head's observation is the `next_obs` of the transition before it, so where that
+    /// transition is mid-episode `reset` closes it off as a truncation and starts one slot later.
+    /// Otherwise the head is overwritten and no slot is spent.
     ///
-    /// Because successor observations are not stored separately, the observation at an
-    /// environment's write head *is* the `next_obs` of the transition before it. Where that
-    /// transition exists and is still mid-episode, `reset` does not overwrite the head; it closes
-    /// the slot off as a truncation -- which is what an abandoned episode is, cut short with its
-    /// final observation known -- and starts the new episode one slot later, costing a single
-    /// slot. Where nothing can reach the head observation it is overwritten and no slot is spent:
-    /// the opening `reset`, back-to-back `reset` calls, and a `reset` straight after a terminated
-    /// or truncated [`save_step`](Self::save_step).
-    ///
-    /// A batch of the wrong shape is an [`InvalidShape`](ReplayBufferError::InvalidShape), raised
-    /// before anything is written. The dtype cannot be wrong here: `obs` is a `DynArrayView` of
-    /// whatever this buffer stores, which is what it was extracted as.
+    /// A wrong shape is an [`InvalidShape`](ReplayBufferError::InvalidShape), raised before
+    /// anything is written.
     pub fn reset(&mut self, obs: DynArrayView) -> ReplayBufferResult<()> {
         let obs = obs_frame("obs", obs, self.observations.shape(), self.obs_stack)?;
 
         for env in 0..self.num_envs() {
             match self.head_type(env) {
-                // Nothing can reach the head slot, so the observation simply lands there.
                 SlotType::Reset => {}
                 SlotType::Final => {
-                    // The head already holds an observation. Where the transition before it is
-                    // still mid-episode that observation is its `next_obs`, so overwriting it would
-                    // corrupt the pair; an abandoned episode is exactly a truncation, so close the
-                    // transition off as one and start a slot later. Otherwise -- a repeated
-                    // `reset`, or an episode that has already ended -- nothing reads the head and
-                    // it is free.
+                    // Mid-episode, the head is the previous transition's `next_obs`. Otherwise
+                    // nothing reads it.
                     if let Some(prev) = self.prev_written(env)
                         && self.slot_type(env, prev) == SlotType::Normal
                     {
@@ -794,15 +680,13 @@ impl ReplayBuffer {
 
     /// Records one transition per environment and advances each write head.
     ///
-    /// Every argument is indexed by environment. `next_obs` takes the same two shapes `obs` does
-    /// in [`reset`](Self::reset), and is whatever the environment returned alongside the reward:
-    /// under Gymnasium's default `AutoresetMode.NEXT_STEP` that is the episode's *final*
-    /// observation wherever `terminated` or `truncated` is set. The call after such a step carries
-    /// the new episode's first observation together with an action and a reward the environment
-    /// ignored; it completes no transition and does not grow `len(self)`.
+    /// Every argument is indexed by environment, and `next_obs` takes either shape `reset`'s `obs`
+    /// does. Where `terminated` or `truncated` is set it is the episode's final observation. The
+    /// call after that carries the new episode's first observation with a placeholder action and
+    /// reward; it completes no transition and does not grow `len`.
     ///
-    /// An argument of the wrong shape is an [`InvalidShape`](ReplayBufferError::InvalidShape),
-    /// raised before anything is written.
+    /// A wrong shape is an [`InvalidShape`](ReplayBufferError::InvalidShape), raised before
+    /// anything is written.
     pub fn save_step(
         &mut self,
         actions: DynArrayView,
@@ -833,9 +717,8 @@ impl ReplayBuffer {
             }
         }
 
-        // The action and reward complete the transition the head already holds. On an autoreset
-        // call the head holds no such transition and these are placeholders, which the next call
-        // overwrites in place.
+        // These complete the transition at the head, or on an autoreset call are placeholders the
+        // next call overwrites.
         dyn_write_batch(&mut self.actions, &self.env_heads, &actions);
         write_batch(&mut self.rewards, &self.env_heads, rewards);
 
@@ -843,8 +726,6 @@ impl ReplayBuffer {
             let (terminated, truncated) = (terminated[env], truncated[env]);
 
             match self.head_type(env) {
-                // The head holds the observation this transition starts from, so the action and
-                // reward just written complete it.
                 SlotType::Final => {
                     let slot = self.env_heads[env];
                     self.set_slot_type(
@@ -859,10 +740,7 @@ impl ReplayBuffer {
                     self.set_slot_prio(env, slot, self.max_prio);
                     self.advance_head(env);
                 }
-                // Gymnasium's next-step autoreset: the episode ended on the previous call, so this
-                // one carries the new episode's first observation together with a placeholder
-                // action and reward. There is no transition to complete, and the placeholders are
-                // overwritten by the next call, which lands on this same slot.
+                // Autoreset: there is no transition to complete.
                 SlotType::Reset => {}
                 ty => unreachable!("head slot is {ty:?}, which no completed call leaves behind"),
             }
@@ -871,9 +749,8 @@ impl ReplayBuffer {
             self.set_slot_type(env, obs_slot, SlotType::Final);
             self.set_slot_prio(env, obs_slot, 0.0);
 
-            // Under next-step autoreset the observation just claimed is the episode's *last*, and
-            // the reset observation arrives on the following call. Leave the final observation
-            // where it is and give the new episode a slot of its own.
+            // That observation is the episode's last; the reset observation the next call brings
+            // gets a slot of its own.
             if terminated || truncated {
                 self.advance_head(env);
                 let head = self.env_heads[env];
@@ -888,16 +765,10 @@ impl ReplayBuffer {
         Ok(())
     }
 
-    // Drawing a batch: the age band a draw may land on, the frame stack behind it and the
-    // n-step rollout in front of it. What these do not cover is *which* transition to draw, which
-    // is `sampling`'s job; it reaches them through the crate root.
+    // Drawing a batch: the walks `sampling` builds on, and the gather.
 
-    /// The ages a draw may land on in `env`, per [`valid_ages`], or `None` when it cannot serve
-    /// one yet.
-    ///
-    /// Recomputed wherever it is needed rather than gathered into a per-environment table up
-    /// front: `n_steps` is the only part of it that a draw brings along, so the whole band is
-    /// three integer operations on state the buffer already has.
+    /// The ages a draw may land on in `env`, per [`valid_ages`]. Recomputed per call rather than
+    /// tabled, since it is three integer operations.
     fn samplable_slot_ages(&self, env: usize, n_steps: u32) -> Option<RangeInclusive<u32>> {
         valid_ages(
             self.env_lens[env],
@@ -907,14 +778,11 @@ impl ReplayBuffer {
         )
     }
 
-    /// Fills `out` with the slots holding the frames of the stack ending at `slot`, oldest first.
+    /// Fills `out` with the slots of the frame stack ending at `slot`, oldest first.
     ///
-    /// The walk stops at an episode boundary and repeats the oldest frame it reached, which is
-    /// what an environment's own frame-stack wrapper does at the start of an episode -- so the
-    /// batch matches what the policy actually saw. A boundary is a `Final` slot: those hold an
-    /// observation and no action, and every one of them is either the write head, which the age
-    /// band keeps this walk away from, or the observation an ended episode was parked on, whose
-    /// successor belongs to the next episode.
+    /// At an episode start the walk repeats the oldest frame it reached, as a frame-stack wrapper
+    /// does. An episode starts after a `Final` slot: the age band keeps the walk off the write
+    /// head, so any `Final` behind `slot` is an ended episode's parked observation.
     fn stack_from(&self, env: usize, mut slot: u32, out: &mut [u32]) {
         let capacity = self.env_capacity() as u32;
         let (newest, rest) = out.split_last_mut().expect("a stack is at least one frame");
@@ -923,8 +791,6 @@ impl ReplayBuffer {
         for i in (0..rest.len()).rev() {
             let prev = (slot + capacity - 1) % capacity;
             if self.slot_type(env, prev) == SlotType::Final {
-                // The episode starts here. Repeat its opening frame over the rest of the stack,
-                // which is what the environment's own frame-stack wrapper does.
                 rest[..=i].fill(slot);
                 break;
             }
@@ -933,15 +799,12 @@ impl ReplayBuffer {
         }
     }
 
-    /// Rolls an `n_steps` return forward from `slot`, or rejects the draw.
+    /// Rolls an `n_steps` return forward from `slot`: the discounted return, the slot of the
+    /// observation it ended on, and whether that is a true episode end.
     ///
-    /// Returns the discounted return, the slot holding the observation the rollout ended on, and
-    /// whether it ended on a true episode end -- so that nothing is bootstrapped past it.
-    ///
-    /// Rejects when `slot` holds no transition, and when the rollout meets a truncation with steps
-    /// still to go: the caller applies one `discount ** n_steps` to the whole batch, so a return
-    /// that stopped early would be bootstrapped with the wrong exponent -- unless nothing is
-    /// bootstrapped at all, which is exactly the terminal case, and why that one is kept.
+    /// `None` when `slot` holds no transition, or when the rollout meets a truncation with steps
+    /// to go, since the caller applies one `discount ** n_steps` to the whole batch. A terminal is
+    /// kept: nothing is bootstrapped past it.
     fn rollout(
         &self,
         env: usize,
@@ -962,10 +825,8 @@ impl ReplayBuffer {
                 SlotType::Normal => {}
                 SlotType::Terminal => return Some((ret, slot, true)),
                 SlotType::Truncated => return (step + 1 == n_steps).then_some((ret, slot, false)),
-                // The write head and the observation parked after an episode end hold no reward.
-                // Only a rollout's *first* slot can be one of those: every parked observation sits
-                // directly behind a boundary, and the walk stops at every boundary. So this is a
-                // draw to reject, not a buffer to distrust.
+                // Only the first slot can be incomplete: every parked observation sits right after
+                // a boundary, where the walk has already stopped.
                 SlotType::Final | SlotType::Reset => {
                     debug_assert_eq!(step, 0, "rollout walked into an incomplete slot");
                     return None;
@@ -976,19 +837,12 @@ impl ReplayBuffer {
         Some((ret, slot, false))
     }
 
-    /// Draws `batch_size` transitions, returning
-    /// `(indices, prios, obs, act, rewards, terminals, next_obs)`.
+    /// Draws `batch_size` transitions.
     ///
-    /// `indices` are the flat indices described in the module docs, to be handed back to
-    /// [`update_prios`](Self::update_prios). `prios` holds each drawn transition's stored priority
-    /// as it stands, and `1.0` throughout for a buffer sampling uniformly. It is raw rather than
-    /// normalised so that the caller can pick its own denominator: [`sum_prios`](Self::sum_prios)
-    /// turns it into the sampling probability, and [`max_prio`](Self::max_prio) into a weight
-    /// scaled against the whole buffer rather than against the batch that came back.
-    ///
-    /// `rewards` is the accumulated `n_steps` return and `next_obs` the observation `n_steps`
-    /// later, with `terminals` set only for true episode ends: a transition truncated by a time
-    /// limit should still be bootstrapped from, so it is not marked terminal here.
+    /// `indices` go back to [`update_prios`](Self::update_prios). `prios` are the stored
+    /// priorities, unnormalised, and `1.0` throughout without priorities. `rewards` is the
+    /// `n_steps` return and `next_obs` the observation `n_steps` later; `terminals` marks true
+    /// episode ends only, since a time-limit truncation is still bootstrapped from.
     pub fn sample(
         &mut self,
         batch_size: usize,
@@ -1024,14 +878,9 @@ impl ReplayBuffer {
         }
         obs_shape.extend_from_slice(&self.observations.shape()[2..]);
 
-        // Field order here is the borrow checker's, not `Batch`'s: the action gather borrows
-        // `batch.indices` and `Array1::from_vec` moves it, so every gather has to be written
-        // before the two `from_vec`s that consume their columns.
+        // Every gather comes before the `from_vec`s that move the columns it borrows.
         Ok(Batch {
-            // `dyn_gather` returns one row per slot, so a stacked draw arrives with its frames
-            // folded into the batch axis; `obs_shape` unfolds them. The count is the same either
-            // way -- `obs_slots` holds `batch_size * obs_stack` entries -- so the reshape cannot
-            // fail, and it is free on a freshly allocated contiguous array.
+            // The gather folds the stack into the batch axis; the reshape unfolds it, for free.
             obs: dyn_gather(&self.observations, &batch.obs_slots, capacity)
                 .into_shape_with_order(obs_shape.clone())
                 .expect("the gather returned one row per stacked frame"),
@@ -1048,20 +897,14 @@ impl ReplayBuffer {
 
     // Priorities.
 
-    /// Replaces the priorities at `indices` with `prios`.
+    /// Replaces the priorities at `indices` with `prios`, which must be finite and non-negative.
+    /// Duplicate indices apply in order, so the last wins. No exponent is applied.
     ///
-    /// Both arrays must be the same length, and the priorities must be finite and non-negative.
-    /// Duplicate indices are applied in order, so the last value for an index wins. No exponent is
-    /// applied here -- see the module docs on where `alpha` belongs.
+    /// Also sets `max_prio` to the larger of `prios`' maximum and its previous value times
+    /// `max_prio_decay`. A running maximum would keep handing new transitions the priority of
+    /// early training's large TD errors.
     ///
-    /// This also refreshes the priority that newly written transitions are given, as the larger of
-    /// the highest priority in `prios` and the previous value decayed by `max_prio_decay`. Decaying
-    /// rather than keeping a running maximum matters over a long run: TD errors shrink as the agent
-    /// improves, so a maximum that never falls would keep handing new transitions a priority drawn
-    /// from early training and heavily oversample them. Note that the decay is applied per call, so
-    /// its half-life is measured in gradient steps and shifts with the replay ratio.
-    ///
-    /// A buffer built without priorities has nothing to update, and says so with a
+    /// Without priorities this is a
     /// [`RequiresPriorities`](ReplayBufferError::RequiresPriorities).
     pub fn update_prios(
         &mut self,
@@ -1079,9 +922,7 @@ impl ReplayBuffer {
             ));
         }
 
-        // Validate the whole batch before touching the tree. Failing part way through would leave
-        // the buffer sampling from a mix of old and new priorities, with nothing to tell the
-        // caller how far the update got.
+        // Validate everything first, so a bad batch leaves the tree untouched.
         let len = rb_prios.len();
         for (&i, &p) in indices.iter().zip(prios) {
             if len <= i as usize {
@@ -1108,10 +949,8 @@ impl ReplayBuffer {
         Ok(())
     }
 
-    /// Sum of every stored priority: the normalising constant that turns [`sample`](Self::sample)'s
-    /// priorities into probabilities.
-    ///
-    /// A buffer built without priorities has no such constant, and says so with a
+    /// Sum of every stored priority, which turns [`sample`](Self::sample)'s priorities into
+    /// probabilities. Without priorities this is a
     /// [`RequiresPriorities`](ReplayBufferError::RequiresPriorities).
     pub fn sum_prios(&self) -> ReplayBufferResult<f32> {
         let Some(prios) = &self.prios else {
@@ -1131,9 +970,8 @@ pub(crate) mod test_support {
 
     use crate::dyn_array::DType;
 
-    /// The smallest buffer the walks care about: one scalar observation and action per slot, since
-    /// nothing below gathers either of them. Seeded, because a draw advances the buffer's own
-    /// generator and the assertions below are about which slots come back.
+    /// One scalar observation and action per slot, since nothing here gathers either. Seeded,
+    /// since the tests assert which slots a draw returns.
     pub(crate) fn spec() -> ReplayBufferSpec<'static> {
         ReplayBufferSpec::new(&[], DType::U8, &[], DType::U8).with_seed(Some(0))
     }
@@ -1144,9 +982,8 @@ pub(crate) mod test_support {
             .with_discount(Some(0.99))
     }
 
-    /// A one-environment buffer with its slots laid out directly, rather than driven there through
-    /// the write path: `types` is the whole environment, one entry per slot, and each slot's reward
-    /// is its own index so that a rollout's arithmetic is readable at a glance.
+    /// A one-environment buffer laid out directly: `types` is the whole environment, and each
+    /// slot's reward is its own index.
     pub(crate) fn one_env(
         head: u32,
         len: u32,
@@ -1187,8 +1024,7 @@ mod tests {
         check_batch_shape("act", &[2, 1], &[2, 8]).unwrap_err();
     }
 
-    /// [`obs_frame`], with the error kept out of the assertions -- only the shape it picks is
-    /// under test here, and every rejection is the same `None` to these cases.
+    /// [`obs_frame`], with every rejection reduced to `None`.
     fn frame(batch: &ArrayD<u8>, stored: &[usize], stack: Option<u32>) -> Option<ArrayD<u8>> {
         let batch = DynArrayView::U8(batch.view());
         let stack = stack.map(|stack| NonZero::new(stack).unwrap());
@@ -1236,15 +1072,9 @@ mod tests {
         assert!(frame(&ArrayD::zeros(IxDyn(&[3, 3, 2])), &stored, Some(3)).is_none());
     }
 
-    /// A one-environment buffer driven through `reset`/`save_step`. One environment's bookkeeping
-    /// *is* the boundary state machine's whole context, so a scalar observation per slot is all
-    /// these need -- and every call writes the next value of a counter as its observation, so
-    /// `obs` reads back as a map of which call's observation landed in which slot, against the
-    /// `types` of the same slots. A slot still holding `0` was never written.
-    ///
-    /// Reading the observations rather than the slot the write picked is deliberate: the slot is
-    /// only `save_step`'s scratch on the way there, and two `Final` slots in the same buffer are
-    /// told apart by what is *in* them, not by their type.
+    /// A one-environment buffer driven through `reset`/`save_step`, each call writing the next
+    /// value of a counter as its observation. So `obs` reads back as which call landed in which
+    /// slot; a slot still holding `0` was never written.
     struct TestEnv {
         rb: ReplayBuffer,
         /// The observation the next call writes. Starts at one, so `0` means untouched.
@@ -1340,8 +1170,7 @@ mod tests {
 
     #[test]
     fn test_repeated_reset_spends_no_slot() {
-        // Nothing can read the head observation yet, so a second and third `reset` just overwrite
-        // it. This used to fall through the state machine and panic.
+        // Nothing can read the head observation yet, so each `reset` overwrites it.
         let mut env = TestEnv::new(4);
         for tick in 1..=3 {
             env.reset();

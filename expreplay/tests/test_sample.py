@@ -58,10 +58,8 @@ def play(
         value, ended = nxt, terminated
 
 
-# Every dtype the buffer stores, in the order `dyn_array.rs` lists them. These only reach
-# Python -- `cargo test` builds no interpreter, so the boundary that converts them is the one
-# thing the Rust tests cannot touch. `bfloat16` is not numpy's: importing ml_dtypes is what
-# registers it, and the buffer refuses it like any other unsupported dtype where nothing has.
+# Every dtype the buffer stores, in `dyn_array.rs`'s order. `cargo test` builds no interpreter,
+# so only these tests reach the conversion. Importing ml_dtypes registers `bfloat16` with numpy.
 DTYPES: list[type[np.generic]] = [
     np.uint8,
     np.uint16,

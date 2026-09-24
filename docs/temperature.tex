@@ -1,0 +1,2727 @@
+\documentclass{article}
+
+% Typeset to match Munchausen (arXiv:2007.14430): its own neurips_2020.sty, its package set and
+% its theorem environments, so that a page of this diffs against a page of that.
+\PassOptionsToPackage{numbers, compress}{natbib}
+\usepackage[colorlinks,bookmarks,bookmarksnumbered,linkcolor=blue!55!black,
+            citecolor=blue!55!black,urlcolor=blue!55!black]{hyperref}
+
+\usepackage[final]{neurips_2020}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\mathtoolsset{showonlyrefs=true}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage[dvipsnames]{xcolor}
+
+% The style file has no place for a date; its first-page notice does.
+\makeatletter
+\renewcommand{\@noticestring}{rlexp26 --- 2026-09-21, seventh revision: the distortion family is named,
+given the invariants it has to satisfy, and corrected --- the head fits expectiles, not quantiles.
+$\srankb$ is written $\srank$ outside the sections where the family is the subject.}
+\makeatother
+
+\newcommand{\states}{\mathcal{S}}
+\newcommand{\actions}{\mathcal{A}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\h}{\mathcal{H}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator{\mmax}{mellowmax}
+\DeclareMathOperator{\sm}{sm}
+\DeclareMathOperator{\lse}{lse}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\Cov}{Cov}
+\newcommand{\env}{\mathrm{env}}
+\newcommand{\tot}{\mathrm{tot}}
+\newcommand{\reg}{\mathrm{reg}}
+\newcommand{\gapop}{\delta}
+\newcommand{\ta}{\tau_{\mathrm{act}}}
+\newcommand{\gap}{\Delta}
+\newcommand{\gapbar}{\overline{\Delta}}
+\newcommand{\dbar}{\bar{d}}
+\newcommand{\sret}{\sigma_{\mathrm{ret}}}
+\newcommand{\srank}{\sigma}
+\newcommand{\srankb}{\sigma^{\beta}}
+\newcommand{\snorm}{\sigma_{G}}
+\newcommand{\snoise}{\sigma_{\varepsilon}}
+\newcommand{\ip}[2]{\langle #1, #2 \rangle}
+\newcommand{\yes}{\ensuremath{\checkmark}}
+\newcommand{\no}{\ensuremath{\times}}
+\newcommand{\meh}{\ensuremath{\sim}}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\title{The behaviour policy: what the cases require,\\and the rule that meets them}
+\author{rlexp26}
+
+\begin{document}
+\maketitle
+
+
+\begin{abstract}
+One object is being chosen: the map from the critic's action values at a state to the
+distribution the actor samples from. Today that map is
+$\sm(\tilde{q}/\texttt{ACT\_TEMPERATURE})$, and the constant in it carries a value scale, does
+not transfer between games, and has no principled setting.
+
+\S\ref{sec:bg} is the setting and every definition used later, including what a family of
+distortions has to satisfy and --- \S\ref{sec:family} --- which one this critic turns out to
+emit. \S\ref{sec:obj} states what would count as a replacement, and \S\ref{sec:rule} states the
+one proposed: $\tau(s) = \min(\srank(s)/g,\; \gapbar(s)/k_0)$, where $\gapbar$ is the mean action
+gap at the state and $\srank$ is the spread of the action \emph{ordering} across the critic's own
+return distribution --- two reductions over an array \texttt{\_act} already holds, on any critic
+that emits a distribution. \S\ref{sec:cases} is the body of the document: ten cases --- seven
+constructed, three observed --- each of which imposes one constraint, and a table of which
+candidate rules fail which. The cases retire, in order: a fixed sharpness constant, a fixed
+absolute regret budget, $\epsilon$-greedy, an entropy target, a calibration read off the top-two
+action gap, and a fixed \emph{fractional} regret target.
+
+\textbf{Every number in this document is in \S\ref{sec:meas} and nowhere else.} The sections
+before it argue over families of rules and say which properties decide between them; that section
+is where a property is given a value, a candidate is given a score, and the family is closed down
+to one member. A claim stated qualitatively here is a claim discharged there.
+
+Three of those measurements decide the shape of the rule rather than only its constants.
+$\srank$ is chosen over every epistemic denominator because none of the latter transfers, and the
+failure is located in the parameter draw rather than in the statistic: \texttt{NoisyLinear}'s
+noise is shared across the actor batch and redrawn every step, so it is dithering and not
+posterior sampling (Remark~\ref{rem:peraction}). \emph{Nothing computable for free anneals},
+which \S\ref{sec:c11} turns into a case that every free rule fails and \S\ref{sec:readmit} is the
+price of answering. And coupling $\tau(s)$ into the loss is the better-posed design, on four
+counts and against no surviving objection, yet is not the thing to run next --- coupled,
+$g \to \infty$ no longer recovers the best arm this project has run, so the family stops
+containing it (\S\ref{sec:decouple}). \S\ref{sec:related} is ten papers, of which one moves the
+design: Fox (2019) derives \eqref{eq:rule}'s shape in closed form with the signal-to-noise ratio
+\emph{squared}, and that exponent is the sharpest open question here.
+\end{abstract}
+
+\section{Background and notation}
+\label{sec:bg}
+
+Nothing in this section is new and nothing in it is a decision. It is the setting, the four
+properties of the agent that the rest of the document uses, every symbol that appears later, and
+--- \S\ref{sec:kept} --- two results about M-VI's fixed point that everything below takes as
+given.
+
+\paragraph{The setting.} A discounted MDP with a finite action set $\actions$ and
+$\gamma = 0.997$, solved by a value-based agent: a critic is fitted by temporal-difference
+regression on transitions drawn from a replay buffer, and an actor fills that buffer by playing
+the environment. The critic emits numbers, the actor needs a distribution to sample from, and the
+map between the two is a free choice. That map is this document's whole subject. The agent is BTR
+(\texttt{arXiv:2411.03820}): a dueling IQN head on an Impala trunk, Munchausen, prioritised
+replay, and \texttt{NoisyLinear} layers in the head. Four of its properties are used below and
+each is stated here.
+
+\paragraph{The critic is distributional.} It emits, per action, a representation of the
+distribution $Z(s,a)$ of the discounted return and not only its mean. Two instances matter. IQN
+samples quantile levels and returns the return value at each --- $z_u(s,a)$,
+\texttt{IQN\_ACT\_SAMPLES} levels per call in \texttt{\_act}; IQN's own name for the level is $\tau$, which is written $u$
+throughout so that $\tau$ can be the scale this document chooses. A categorical head instead
+returns probabilities $p_i(s,a)$ on a fixed grid of atoms $z_i$. In both,
+$\tilde{q}(s,a) = \E Z(s,a)$ is the action value the policy is built from: the mean over sampled
+quantiles in the first case, $\sum_i p_i z_i$ in the second. The plan of record puts a categorical
+head ahead of this design, so every quantity below is defined as a functional of $Z$ and then
+instanced in both. The head is also \emph{dueling}: a state-value stream and an
+action-advantage stream, summed. That matters exactly once, at \S\ref{sec:c10}, where it is
+what puts risk the action does not control into the value stream and out of the ordering.
+
+\paragraph{Gaps, and the regret of a policy.} $\gap_a(s) = \max_b \tilde{q}(s,b) -
+\tilde{q}(s,a) \ge 0$ are the action gaps and $\gapbar(s) = \frac{1}{|\actions|}\sum_a \gap_a(s)$
+their mean, which is also the regret of acting uniformly at $s$ and is the \texttt{uniform} row
+of \texttt{scripts/probe\_checkpoint.py}. For any policy,
+\[
+  \rho(\pi;s) \;=\; \max_a \tilde{q}(s,a) - \ip{\pi}{\tilde{q}}(s) \;\ge\; 0
+\]
+is its \emph{exploration regret} at $s$: what one decision at $s$ costs, in the critic's own
+units and on the critic's own account. $Q^\star(s) = \max_a \tilde{q}(s,a)$ is the greedy value
+it is measured against, and a regret quoted below as a percentage is $\rho$ over $Q^\star$.
+$\h(\pi) = -\ip{\pi}{\ln\pi}$, and $\sm$ is the softmax, spelled as Munchausen spells it.
+
+\paragraph{Distortions, and what a family has to satisfy.} A \emph{distortion} $\beta$ maps a
+return distribution to a scalar \emph{on the return axis}: the mean, the median, a quantile, an
+expectile, a tail mean. Write $Q_\beta(s,a)$ for the value of $a$ read through $\beta$, and
+$A_\beta(s,a) = Q_\beta(s,a) - \frac{1}{|\actions|}\sum_b Q_\beta(s,b)$ for the advantage centred
+over actions. A \emph{family} is a set of distortions, written $\beta$ where naming it matters.
+Two properties are demanded of every member, and neither is decoration:
+
+\begin{itemize}
+  \item \textbf{Translation equivariance}, $\beta(Z + \delta) = \beta(Z) + \delta$. This is what
+  delivers the zero set below, and it is the property that fails first. \S\ref{sec:meas-family}
+  exhibits two natural readings of a categorical head that lack it --- one of which reports a
+  spread that \emph{grows} the better the ordering is resolved, which is the sign error this
+  document could least afford.
+  \item \textbf{Positive homogeneity}, $\beta(cZ) = c\,\beta(Z)$ for $c > 0$, so that the spread
+  below carries the value unit and the gain dividing it stays dimensionless --- which is
+  \S\ref{sec:project}'s standing constraint, discharged at the level of the family rather than
+  per rule.
+\end{itemize}
+
+Quantiles, expectiles, the mean, and a tail mean taken at the distribution's \emph{own} quantile
+satisfy both. A tail mean at a threshold fixed on the support does not, and neither does anything
+read off atom \emph{probabilities} rather than atom values --- those are not on the return axis
+at all.
+
+\paragraph{Two spreads, and what they mean.} Two means over actions:
+\[
+  \sret(s) = \frac{1}{|\actions|}\sum_a \mathrm{sd}\,Z(s,a),
+  \qquad
+  \srankb(s) = \frac{1}{|\actions|}\sum_a \mathrm{sd}_\beta\, A_\beta(s,a).
+\]
+$\sret$ is how wide the returns at $s$ are and needs no family. $\srankb$ is how much the
+\emph{ordering} of the actions depends on which part of the return distribution is read: large
+when the ordering at the optimistic end disagrees with the ordering at the pessimistic end. It is
+a per-state scale, not a per-action bonus --- a mean over actions --- and it is in the units of
+value.
+
+\emph{Notation.} The two are contrasted here and nowhere else; past this subsection $\sret$
+appears only in \S\ref{sec:c10} and \S\ref{sec:denoms}, where it is the candidate being rejected.
+\textbf{The superscript is carried only where the choice of family is the subject --- which is
+this subsection, \S\ref{sec:meas-family} and \S\ref{sec:owed} --- and $\srankb$ is written
+$\srank$ everywhere else.} A bare $\srank$ therefore always means the ordering spread under
+whichever family the head is fitting, $\snorm$ is the dispersion of returns pooled over the
+buffer, and $\snoise$ is \texttt{NoisyLinear}'s learned scale; the three are distinct objects and
+nothing below shortens any of the other two.
+
+\emph{Its zero set is worth stating exactly, because \S\ref{sec:c10} turns on it.}
+$\srank(s) = 0$ iff $A_\beta(s,a)$ is constant in $\beta$ for every $a$, i.e.\ iff
+$Q_\beta(s,a) = c_a + m(\beta)$: every action's return distribution is a \emph{translate} of one
+common shape. \emph{Translation equivariance is exactly what delivers this} --- under it a
+translate moves every reading by the same $\delta$, which the centring then removes, so the
+cancellation is an identity rather than an approximation; a family without it reports a spread
+where there is nothing to report. That is not an ordering condition and stochastic dominance is neither sufficient
+for it nor implied by it --- an action that dominates the rest at every risk level still moves
+$\srank$ if its distribution has a different \emph{shape}. So $\srank$ reads departure from a
+location family, of which an unresolved ordering is one case and heteroscedasticity across
+actions is another.
+
+\paragraph{The two uncertainties, and the estimator that separates them.} A spread of the
+critic's output mixes what more data would remove with what it would not. Write
+$y_i(\theta)$ for the network's output at quantile index $i$ under parameters $\theta$; then
+$\sigma^2_{\mathrm{epi}} = \E_i \Var_\theta(y_i)$ and
+$\sigma^2_{\mathrm{ale}} = \Var_i(\E_\theta y_i)$ partition $\Var_{\theta,i}(y_i)$, and both have
+\emph{unbiased} estimators from two draws $\theta_A, \theta_B$ of the parameter posterior:
+\begin{equation}
+  \tilde{\sigma}^2_{\mathrm{epi}} = \tfrac12 \E_i\big[(y_i(\theta_A) - y_i(\theta_B))^2\big],
+  \qquad
+  \tilde{\sigma}^2_{\mathrm{ale}} = \Cov_i\big(y_i(\theta_A),\, y_i(\theta_B)\big).
+  \label{eq:uasplit}
+\end{equation}
+It is Clements et al.'s and \S\ref{sec:related} is the reading; it is stated here because
+\S\ref{sec:c10}, \S\ref{sec:c11} and \S\ref{sec:readmit} all turn on it and because
+\S\ref{sec:denoms} reports both halves. Applied to $y_i = z_u$ it splits $\sret$; applied to
+the centred advantage it splits $\srank$. One extra pass through the output projections buys
+both, and \emph{whether the draws are posterior samples} is the whole question of how much that
+is worth --- Remark~\ref{rem:peraction}.
+
+\paragraph{The parameter draw.} \texttt{NoisyLinear} adds $\snoise \odot \varepsilon$ to the
+weights and biases of the head's linear layers, with $\varepsilon$ factorised Gaussian noise
+redrawn on every call and $\snoise$ learned. It is a large fraction of the network's parameters
+and
+it is the project's other exploration mechanism: acting greedily on a draw is arm (E) below.
+$\dbar(s)$ is the mean over actions of the standard deviation of $\tilde{q}(s,a)$ across draws
+of that noise, the quantile sample held fixed --- the previous revision's proposed denominator.
+One draw is shared by all $64$ environments and replaced at the next step, so it is dithering and
+not posterior sampling; Remark~\ref{rem:peraction} is that reading in full.
+
+\paragraph{Munchausen, and the one coefficient it puts in the loss.} The loss adds
+$\alpha\,[\tau_\ell \ln \pi_\theta(a_t|s_t)]_{l_0}^{0}$ to the reward, with
+$\pi_\theta = \sm(\tilde{q}/\tau_\ell)$,
+$\alpha = \texttt{MUNCHAUSEN\_SCALING\_TERM} = 0.9$,
+$\tau_\ell = \texttt{MUNCHAUSEN\_TEMPERATURE} = 0.03$ and
+$l_0 = \texttt{MUNCHAUSEN\_CLIPPING\_VAL} = -1$, which is the value every run and every checkpoint
+quoted in \S\ref{sec:meas} was produced at. One finished run moved it and it was moved back;
+\S\ref{sec:c8-staging} is what that run says, and \S\ref{sec:meas-k} is the one measurement in
+this document sensitive to which value is in force. What matters here is that the converged
+critic
+\emph{is} a policy at the scale $\tau_\ell$ --- its fixed point's gaps are $1/(1-\alpha)$ times
+those of the entropy-regularised MDP being solved, so $\sm(q_\infty/\tau_\ell)$ is exactly that
+MDP's soft-optimal policy, which is Proposition~\ref{prop:amp} and is proved in
+\S\ref{sec:kept} below. $\tau_\ell$ is a coefficient
+in the loss and is not what this document chooses; \S\ref{sec:decouple} is why the two are kept
+apart for now, and the one place they touch is the ceiling $\tau(s) \le \tau_\ell$ --- a bound
+that exists only because they are apart.
+
+\paragraph{Sharpness, and why ``temperature'' is not the word for it.} What a Boltzmann policy
+divides by is a scale with the units of value, and every failure below is a failure to get those
+units right. The quantity that transfers is its reciprocal in units of the state's own gaps,
+\[
+  k(s) \;=\; \frac{\gapbar(s)}{\tau(s)},
+\]
+called the \textbf{sharpness} throughout and quoted in place of a temperature everywhere a
+setting is given. It is dimensionless and comparable between games: $k = 0$ is the uniform policy
+and $k \to \infty$ is argmax. The status quo is a fixed $\texttt{ACT\_TEMPERATURE}$, so its $k$ is
+$\gapbar(s)/\tau$ with $\tau$ held constant --- one constant yielding as many sharpnesses as the
+games have gap scales, which is the complaint in one line and which \S\ref{sec:denoms} measures.
+$k$ is also a mean, and a softmax does not respond to the mean, which is why it is quoted as a
+setting and never used as an estimate of anything.
+
+\paragraph{The constants of the setting.} These are the problem's givens rather than anything
+measured, so they are stated here and the theory below is written against them: $\gamma = 0.997$,
+so the per-decision horizon is $H = 1/(1-\gamma) = 333$ steps; $n = \texttt{N\_STEP} = 3$;
+$|\actions| = 8$ on Phoenix and $18$ on Zaxxon; $64$ environments in the actor; $200$M frames in
+a full budget; and Munchausen's $\alpha$, $\tau_\ell$ and $l_0$ as above. Everything else with a
+value in it is in \S\ref{sec:meas}. There, every score is quoted as a ratio to BTR's published
+number on the same game, and every figure in value units is labelled with its game, because the
+two do not transfer into each other.
+
+\subsection{Which family the head is fitting}
+\label{sec:family}
+
+\S\ref{sec:bg}'s definitions leave the family open, and it is not a free choice here: the loss
+picks it. This is which one is in force under each head, a correction to what the previous five
+revisions said about that, and the categorical instance. \emph{Nothing in \S\ref{sec:cases} or
+\S\ref{sec:rule} depends on the answer} --- which is why the invariants are stated before the
+instance rather than read off it.
+
+\paragraph{Under IQN it is the expectiles, not the quantiles.} The members are the sampled
+levels, $Q_u = z_u$, so $\srank$ is the spread of the centred advantage along the level axis and
+$\sret$ is the return's own standard deviation; both are reductions over the
+$[\texttt{IQN\_ACT\_SAMPLES}, |\actions|]$ array \texttt{\_act} has already formed and is about
+to average away. \emph{But $z_u$ is the $u$-expectile.} The quantile Huber is a pinball-weighted
+\emph{square} inside its knee and the pinball loss proper outside it, and the minimiser of the
+first is the expectile where the minimiser of the second is the quantile; at
+\texttt{IQN\_HUBER\_LOSS\_K} the knee sits above the range of $|td|$ a run produces
+(\S\ref{sec:meas-family}), so the loss is in its quadratic branch throughout. This document
+asserted the quantile reading for five revisions and it was never what the head fitted.
+
+\paragraph{Nothing structural turns on the correction.} Expectiles are translation-equivariant
+and positively homogeneous exactly as quantiles are, so \S\ref{sec:bg}'s zero set, the units, and
+every case in \S\ref{sec:cases} stand unaltered. What moves is the \emph{scale} of $\srankb$ and
+therefore the gain dividing it, which \S\ref{sec:meas-family} prices. One consequence reaches
+outside this document: the open \texttt{IQN\_HUBER\_LOSS\_K} item in \texttt{btr.py}'s backlog
+proposes lowering the knee to recover the quantile estimand, and doing so would re-scale $g$ ---
+a coupling neither that item nor this document had recorded.
+
+\paragraph{Under a categorical head.} $\sret$ is $\sqrt{\sum_i p_i z_i^2 - \tilde{q}^2}$, one
+more reduction over the same atoms, and the matching family is the expectiles again, which the
+head emits in closed form. The $\beta$-expectile solves
+$\beta\,\E[(Z-e)_+] = (1-\beta)\,\E[(e-Z)_+]$, whose two sides differ by a function piecewise
+linear in $e$ with knots at the atoms; so with $C_k = \sum_{i\le k} p_i$,
+$D_k = \sum_{i\le k} p_i z_i$ and $B_k$, $A_k$ their suffix counterparts, bracketing the sign
+change leaves
+\begin{equation}
+  e_\beta \;=\; \frac{\beta A_k + (1-\beta) D_k}{\beta B_k + (1-\beta) C_k},
+  \label{eq:expectile}
+\end{equation}
+two cumulative sums, one \texttt{searchsorted} and a division --- the cost of a quantile lookup.
+
+\emph{Two claims made in earlier revisions are withdrawn.} The pair ``mean below the median, mean
+above it'' is admissible only when each threshold is that \emph{action's own} median, so it is
+not ``one dot product with a fixed weight vector''; a threshold fixed on the support is not
+translation-equivariant and fails \S\ref{sec:bg}'s first demand. And reading the levels off the
+CDF instead --- the direct analogue of $z_u$ --- is admissible but \emph{quantises}: on a fixed
+support it is blind below one atom spacing, where \eqref{eq:expectile} is smooth in $p$.
+Whether the $\gapbar/\srank$ constant of \S\ref{sec:denoms} survives the change of head is still
+\S\ref{sec:owed}'s, but it is now a question about scale rather than about whether the object is
+the same one.
+
+\subsection{Two results on M-VI's fixed point}
+\label{sec:kept}
+
+Both are short, both were checked numerically, and both bear on constants this document uses.
+
+\begin{proposition}[M-VI's action gap; Munchausen Thm.~2 with the arithmetic redone]
+\label{prop:amp}
+Let $(q_k,\pi_k)$ be produced by M-VI($\alpha,\tau$) without error, $0 \le \alpha < 1$,
+$\lambda = (1-\alpha)\tau$, and $\gapop(q)(s) = \max_a q(s,a) - q(s,\cdot)$. Then
+$\lim_k \gapop(q_k) = \frac{1}{1-\alpha}\gapop(q_*^{\lambda})$ and
+$\sm(\lim_k q_k/\tau) = \sm(q_*^{\lambda}/\lambda) = \pi_*^{\lambda}$.
+\end{proposition}
+\begin{proof}
+Munchausen's own proof establishes $\lim_k q_k = q_*^\lambda + \alpha\tau\ln\pi_*^\lambda$ and
+$\tau\ln\pi_*^\lambda = \frac{1}{1-\alpha}(q_*^\lambda - \lambda\lse(q_*^\lambda/\lambda))$.
+Substituting, $\lim_k q_k = (1 + \frac{\alpha}{1-\alpha})q_*^\lambda -
+\alpha\tau\lse(q_*^\lambda/\lambda)$, and $1 + \frac{\alpha}{1-\alpha} = \frac{1}{1-\alpha}$. The
+log-sum-exp is action-independent, so it drops out of both the gap and the softmax, and
+$\frac{1}{1-\alpha}/\tau = 1/\lambda$.
+\end{proof}
+
+\begin{remark}[The published constant is $\frac{1+\alpha}{1-\alpha}$ and that is a slip]
+\label{rem:erratum}
+At $\alpha = 0.9$ the published constant is $19$ against the correct $10$. The error is in the
+last line of Munchausen's Appx.~A.4, where $1 + \frac{\alpha}{1-\alpha}$ is collected as
+$\frac{1+\alpha}{1-\alpha}$ instead of $\frac{(1-\alpha)+\alpha}{1-\alpha} = \frac{1}{1-\alpha}$;
+everything before that line is correct. \texttt{scripts/check\_mvi\_gap.py} iterates M-VI and
+entropy-regularised VI to convergence on random finite MDPs and confirms the corrected constant
+at several $\alpha$, together with $\sm(q_\infty/\tau) = \pi_*^\lambda$, to the precision
+\S\ref{sec:meas-mvi} reports. An independent derivation agrees: decomposing
+$Q_\tot = Q_\env + \alpha[\tau\ln\pi]_{l_0}^{0} + C(s)$ gives $\rho_\env = (1-\alpha)\rho_\tot$
+exactly, the same factor from the other side.
+
+\emph{Why it is in this document.} It settles what $\tau_\ell$ means, and therefore what the
+ceiling of \S\ref{sec:decouple-ledger} is. The network's own output divided by $\tau_\ell$ is the
+soft-optimal policy of the MDP being solved; dividing by $(1-\alpha)\tau_\ell$ instead
+double-counts the amplification by a factor of $1/(1-\alpha)$, and dividing by
+$(1+\alpha)\tau_\ell$, which the published constant implies, is too diffuse by $1+\alpha$. So
+$\tau(s) \le \tau_\ell$ is the correct hard bound and not an arbitrary one.
+\end{remark}
+
+\paragraph{The distortion, which is the whole of what a coupled $\tau$ changes.} A soft backup at
+scale $\lambda$ exceeds a hard one by $\lambda\lse(q/\lambda) - \max_a q$, and that difference is
+the entire effect of regularising. It is worth reading rather than carrying, because everything
+\S\ref{sec:decouple} weighs is this one number.
+
+\emph{The log-sum-exp is a maximum in disguise.} For any $q$ and any $\lambda > 0$,
+\[
+  \lambda\lse(q/\lambda) \;=\; \max_{\pi}\big[\ip{\pi}{q} + \lambda\h(\pi)\big],
+\]
+attained at $\pi = \sm(q/\lambda)$. So the soft backup is not a hard backup with noise added; it
+is the best trade the state admits between taking value and keeping entropy, and the softmax is
+the policy that strikes it rather than a policy chosen by hand. Subtracting $\max_a q$ from both
+sides prices that trade in the two terms this section has already defined,
+\[
+  \underbrace{\lambda\lse(q/\lambda) - \max_a q}_{\text{what the trade is worth}}
+  \;=\; \underbrace{\lambda\h(\pi)}_{\text{credit for the randomness}}
+  \;-\; \underbrace{\rho(\pi)}_{\text{regret of collecting it}} .
+\]
+It is never negative, so \textbf{a Boltzmann policy's entropy credit always covers its regret}.
+That is a free bound on the currency of \S\ref{sec:c7}, $\rho(\pi_\tau) \le \tau\h(\pi_\tau)
+\le \tau\ln|\actions|$; how slack it is on real states is \S\ref{sec:meas-couple}'s.
+
+Coupling \S\ref{sec:rule}'s rule means putting $\tau(s)$
+in place of $\tau_\ell$ in the loss, hence $\lambda(s) = (1-\alpha)\tau(s)$, and then the agent's
+objective gains that quantity at every step. \emph{Read on the network's own output it carries no
+$\alpha$ at all}: by Proposition~\ref{prop:amp} the gaps of the regularised MDP are $(1-\alpha)$
+times the ones the critic emits, so the $(1-\alpha)$ in $\lambda$ cancels inside the exponent,
+and the amplification $\frac{1}{1-\alpha}$ cancels the one outside it. What is left is
+\begin{equation}
+  D(s) \;=\; \tau(s)\,\ln\sum_a e^{-\gap_a(s)/\tau(s)},
+  \qquad 0 \;\le\; D(s) \;\le\; \tau(s)\ln|\actions|,
+  \label{eq:distortion}
+\end{equation}
+in the units of $\tilde{q}$ and directly comparable with $\gapbar$ --- and the decomposition above
+survives the cancellation unchanged, $D(s) = \tau\h(\pi_\tau) - \rho(\pi_\tau)$ read at the
+critic's own scale, which is the form to check an implementation against. It is what
+\S\ref{sec:c8} weighs and \S\ref{sec:meas-couple} measures.
+
+\emph{In words.} $D(s)$ is what the state's remaining choice is worth --- the premium a soft
+backup pays for not yet having to commit. It is zero where one action is clearly best, because
+there is nothing to hedge, and largest, $\tau\ln|\actions|$, where the actions are tied and the
+choice is free. Coupled, that premium is added to the return at every step, so the agent is paid,
+once per visit, for standing where its own critic has not yet decided. Whether that is a useful
+thing to pay for is \S\ref{sec:c8}; what it costs is \S\ref{sec:meas-couple}.
+
+\emph{How it behaves.} Exponentiating \eqref{eq:distortion} names the quantity $D$ is really
+about. Write
+\[
+  m(s) \;=\; e^{D(s)/\tau(s)} \;=\; \sum_a e^{-\gap_a(s)/\tau(s)} \;\in\; [1,\,|\actions|],
+  \qquad\text{so}\qquad D(s) \;=\; \tau(s)\ln m(s):
+\]
+the greedy action contributes exactly $1$ and every other action contributes according to how
+far it is behind in units of $\tau$, so \textbf{$m$ is the number of actions still in contention
+at that scale} and $D$ is the temperature times its logarithm. The two limits are immediate:
+$m \to 1$ where one action is clearly best and $D \to 0$; $m \to |\actions|$ at a full tie and
+$D \to \tau\ln|\actions|$.
+
+\emph{The top-two shortcut is a special case and not a licence.} If exactly one runner-up is in
+contention then $m \approx 1 + e^{-k_2}$ with $k_2 = \gap_2/\tau$ the sharpness at the top-two
+gap, and $D \approx \tau e^{-k_2}$ --- linear in the temperature, exponential in the near-tie.
+That form is worth having because it shows the exponential does the deciding, but \emph{it is
+only correct when the sum has one live term}, and $D$ is largest exactly where it may not:
+\S\ref{sec:meas-couple} scores it where the bonus actually lives rather than at a typical state,
+and finds it materially wrong there and worse on the larger action set. \textbf{$m$, not $k_2$,
+is the quantity to reason with.} The mean sharpness $k(s)$ is wronger still: it averages over all
+actions, including the ones $D$ cannot hear.
+
+Because $D$ is a logarithm of a sum of exponentials, $D/\tau$ ranges over dozens of decades
+across states, so a mean of it is a tail statistic rather than a typical value --- which is why
+\S\ref{sec:meas-couple} reports $D$-weighted means rather than correlations.
+
+\emph{And $m$ counts actions, which makes $D$ sensitive to how the action set is written down.}
+Duplicating every action multiplies $m$ by the number of copies exactly, so
+\[
+  D \;\longmapsto\; D + \tau(s)\ln(\text{copies}),
+\]
+with no appeal to approximation. The \emph{policy} is untouched by this --- a softmax spreads the
+same total mass over each duplicated value, which is \S\ref{sec:c3} --- so the invariance the
+behaviour rule has, the objective a coupled $\tau$ induces does not. \S\ref{sec:c8} is where that
+matters, because the added term is proportional to $\tau(s)$ and therefore to whatever the rule
+divides by.
+
+\begin{proposition}[Regret is monotone in the scale, and priced by any value function]
+\label{prop:rho}
+Let $\pi_\tau = \sm(v/\tau)$ on a finite action set for any $v$, and
+$\rho_w(\tau) = \max_a w(a) - \ip{\pi_\tau}{w}$ for any $w$. Then
+$d\rho_w/d\tau = \Cov_{\pi_\tau}(v,w)/\tau^{2}$. At $w = v$ this is
+$\Var_{\pi_\tau}(v)/\tau^{2} \ge 0$.
+\end{proposition}
+\begin{proof}
+With $b = 1/\tau$, $\partial\pi_a/\partial b = \pi_a(v_a - \ip{\pi}{v})$, so
+$d\ip{\pi_\tau}{w}/db = \Cov_{\pi_\tau}(v,w)$ and
+$d\rho_w/d\tau = -(d\ip{\pi_\tau}{w}/db)(db/d\tau) = \Cov_{\pi_\tau}(v,w)/\tau^{2}$.
+\end{proof}
+
+Verified against a finite difference at several $\tau$ on unrelated random $v, w$. The $w = v$
+case is the heat capacity of a Boltzmann distribution, $C = \Var(E)/T^{2}$, with $-v$ for energy.
+It is kept because it is what makes the $\rho$ series of \S\ref{sec:meas-rho} interpretable:
+$\rho$ increases in $\tau$, so a measured $\rho$ inverts to a sharpness and the four checkpoints'
+tables can be read against each other. It is no longer inverted numerically by anything --- that
+was the root-find \S\ref{sec:c9} and \S\ref{sec:rule} removed.
+
+
+\section{Problem statement and criteria for adequacy}
+\label{sec:obj}
+
+\paragraph{The object.} A map $\tilde{q}(s,\cdot) \mapsto \pi(\cdot|s)$, evaluated in
+\texttt{\_act} once per environment step per environment, and read by nothing else. Everything
+downstream --- the loss, the target, the replay buffer, the priorities, the evaluator --- is
+untouched by this document.
+
+\paragraph{The criterion, in one sentence.} A rule is acceptable if its constants can be set once
+and left alone across games, across a run's own movement in \texttt{train/q}, and
+across the two failure modes this project has observed --- and if it costs nothing to run and
+nothing to revert.
+
+That is a lower bar than ``explores optimally'' and it is set there deliberately, because
+\S\ref{sec:meas-return} shows the measurable prize is small: four full-budget arms spanning a
+decade of sharpness converge to within a small fraction of each other late in a run, which is
+less than one seed is worth. What is \emph{not} small is the early term, where the same four arms
+span several-fold (\S\ref{sec:meas-return}), and every one of the cases below bears on it. So
+the design goal is not a
+better exploration--exploitation trade-off. It is a behaviour policy whose failure modes are
+bounded by construction rather than by a constant somebody chose, at no cost, that reduces to the
+best-measured arm when the value function is informative.
+
+\paragraph{What the criterion excludes at this price.} A second pass through
+\texttt{value\_linear0}/\texttt{advantage\_linear0} (most of the network's parameters), a
+re-established full-budget baseline, and anything whose constants are in value units.
+\S\ref{sec:dropped} lists what that removes and why each removal is safe, and the rule of
+\S\ref{sec:rule} comes in under it with nothing to spare: two reductions and a division.
+
+\emph{It does not exclude a head or a servo outright, and the previous revision was wrong to
+read it that way.} What it excludes is paying for one without a case that demands it.
+\S\ref{sec:c10} and \S\ref{sec:c11} are two such cases, both failed by every rule that runs for
+free, and \S\ref{sec:readmit} is what they buy.
+
+\subsection{Constraints external to the case analysis}
+\label{sec:project}
+
+They are properties of this project rather than of the problem, and they are stated first because
+each one disqualifies candidates before any case is heard.
+
+\emph{The control path is the asset.} There is one full-budget reference per game and it was
+expensive. A change that perturbs the loss forfeits the comparison until it is re-run. A change
+confined to \texttt{\_act} does not, and can be reverted by deleting it. This is the asset
+\S\ref{sec:decouple} weighs a coupled loss against, and the only reason it defers one.
+
+\emph{No constant may carry a value scale.} \texttt{train/q} moves by more than two orders over
+a run, \texttt{train/action\_gap} by one, and $\mathrm{gap}/q$ is measured to \emph{fall} rather
+than hold; across games the two differ by a further large factor (\S\ref{sec:denoms},
+\S\ref{sec:meas-gap}). A constant in value units is therefore wrong at two ends of one run and at
+both games, and no
+amount of tuning fixes it. This is the whole complaint against \texttt{ACT\_TEMPERATURE} and any
+replacement that repeats it is not a replacement. There are two ways to satisfy it: quote every
+constant as a ratio of two quantities the network emits, which is what \eqref{eq:rule} does, or
+divide the value unit out globally with a return normaliser, which is what the primed
+--- return-normalised --- candidates of \S\ref{sec:cases} do and \S\ref{sec:norm} prices.
+
+\emph{Nothing may depend on how the critic is implemented.} The plan of record puts a categorical
+head ahead of this design, and \S\ref{sec:fixdraw} contemplates deleting \texttt{NoisyLinear}
+altogether, which would return a large fraction of the parameters. A rule that assumes sampled
+quantile
+levels, or assumes a parameter draw is present to do the exploring, is a rule that has to be
+redesigned when either lands --- and worse, a rule whose constants would have to be re-measured
+then, which is the same failure as a constant in value units wearing a different coat. So every
+quantity used below is a functional of the return distribution the critic emits
+(\S\ref{sec:bg}), stated once and instanced twice; and every rule is required to remain a
+well-defined policy when the parameter draw is removed. Stating it as a constraint here is what
+removes the previous revision's separate section arguing, after the fact, that its rule survived
+a change of head.
+
+\section{The proposed rule}
+\label{sec:rule}
+
+\begin{equation}
+  \boxed{\;
+  \tau(s) \;=\; \min\!\left(\frac{\srank(s)}{g},\; \frac{\gapbar(s)}{k_0}\right),
+  \qquad
+  \pi(\cdot\,|\,s) \;=\; \sm\!\left(\frac{\tilde{q}(s,\cdot)}{\tau(s)}\right)
+  \;}
+  \label{eq:rule}
+\end{equation}
+
+\paragraph{In words.} \emph{Act at the width of the state's own ordering, divided by a gain, and
+never more diffusely than a floor.} Both constants are dimensionless: $g$ divides one spread by
+another, and $k_0$ is a sharpness. They are calibrated at \S\ref{sec:meas-g} and
+\S\ref{sec:meas-k}, which is where they are given values. In the sharpness of \S\ref{sec:bg} the
+same rule reads
+\begin{equation}
+  k(s) \;=\; \max\!\left(g\,\frac{\gapbar(s)}{\srank(s)},\; k_0\right),
+  \label{eq:rule-k}
+\end{equation}
+which is the form to compare against the arms that have run, every one of which is a $k$.
+
+\paragraph{Where each piece comes from.} Every line below is a case in \S\ref{sec:cases}; the
+case is the argument and this is only the index into it.
+\begin{itemize}
+  \item \textbf{A Boltzmann policy} rather than a rate: \S\ref{sec:c7}, and \S\ref{sec:c2} in its
+  extreme form. Pricing actions by value is how a given off-greedy rate is bought cheaply, and
+  $\epsilon$-greedy pays an order of magnitude more for the same rate on the measured
+  checkpoints.
+  \item \textbf{$\srank$ in the denominator}: \S\ref{sec:c5} for what it has to carry,
+  \S\ref{sec:c10} for why not $\sret$, \S\ref{sec:denoms} for the fact that it transfers and
+  $\dbar$ does not. It is the only quantity measured here that carries the state's value scale
+  \emph{and} how far the ordering is from resolved, and carries them in one number because it is
+  a spread of the critic's own output --- which is also why \S\ref{sec:c1} and \S\ref{sec:c6}
+  come out exact rather than conditional.
+  \item \textbf{Means over actions, not top-two gaps}: \S\ref{sec:c3}. Both $\gapbar$ and
+  $\srank$ are duplication-invariant; the top-two gap is not, and \S\ref{sec:denoms}'s table has
+  it far apart between this project's two games largely for that reason.
+  \item \textbf{$\gapbar$ only as a floor, never as a target}: \S\ref{sec:c2} and \S\ref{sec:c4}
+  say a target proportional to $\gapbar$ spends most where the options are worst. Its job is
+  narrower than in the previous revision --- it is a guard against $\srank$ itself failing, not
+  the rule's answer to \S\ref{sec:c6} --- and \S\ref{sec:meas-k} places it where fewer than one
+  state in twenty rests on it.
+  \item \textbf{A $\min$ of two bounds rather than a blend}: the two are different kinds of
+  statement and there is no exchange rate between them. Both are upper bounds on how diffuse the
+  policy may be, so both are enforced.
+  \item \textbf{A closed form rather than a root-find}: $\srank$ and $\gapbar$ are available
+  exactly from an array already in registers, so there is no bracket, no bisection count and no
+  tolerance. The one line this deserves is that the constraint form has a degeneracy where the
+  closed form has none, which is \S\ref{sec:c9}. Where \S\ref{sec:readmit} later takes a
+  parameter, it is for a quantity the critic does not emit at all; nothing there is about
+  approximating this one.
+\end{itemize}
+
+\paragraph{Cost.} The trunk runs once and is unchanged, and no second draw is taken. $\srank$ and
+$\gapbar$ are two reductions over the $[\texttt{IQN\_ACT\_SAMPLES}, |\actions|]$ array
+\texttt{\_act} already holds, then a division, a $\min$ and the softmax that is there anyway; a
+categorical head pays two extra dot products instead (\S\ref{sec:bg}).
+\textbf{Zero parameters, zero optimiser state, zero heads, zero target networks, no extra pass,
+no root-find.} In the learner: nothing at all while the two are decoupled, and two more
+reductions over arrays \texttt{\_train\_step} already holds if they are not
+(\S\ref{sec:couple-fixedpoint}). This is strictly cheaper
+than the previous revision's rule, which wanted a second pass through the output projections to
+form $\dbar$.
+
+\paragraph{Which way it fails.} Under IQN, $\srank$ is built out of the head's
+$u$-modulation, and the LayerNorm-plus-weight-decay run is measured to anneal
+\texttt{quantile\_embedding}. If that modulation decays, $\srank$ decays with it and the rule
+sharpens to argmax --- which is the best-measured arm, where the status quo's failure direction
+is the uniform policy, which \S\ref{sec:meas-return} measures as the larger loss. That asymmetry
+is not an accident of
+this denominator but it is worth naming, and $\srank$ is logged so that the decay is visible
+rather than silent.
+
+\paragraph{It contains the best-measured arm.} As $g \to \infty$, $\tau(s) \to 0$ and
+\eqref{eq:rule} is argmax acting with the parameter draw --- arm (E), which
+\S\ref{sec:meas-return} scores above every soft arm over the second half of a full budget. The
+family's sharp limit is the best thing this project has run, so the question a run answers is
+whether a finite $g$ buys anything on top of it, not whether the apparatus beats the baseline.
+That is the only staging under which a negative result costs one run and no baseline.
+
+\begin{remark}[The parameter draw is not posterior sampling as it is wired]
+\label{rem:peraction}
+The previous revision claimed the codebase already performs approximate Thompson sampling, since
+drawing the head noise and acting greedily on the draw is posterior sampling. The claim is
+withdrawn. \texttt{NoisyLinear} draws $\varepsilon_{\mathrm{in}}$ of shape
+$(\texttt{in\_features},)$ and $\varepsilon_{\mathrm{out}}$ of shape
+$(\texttt{out\_features},)$, with no batch axis, on every \texttt{\_\_call\_\_}: one perturbation
+is shared by the whole actor batch, and it is replaced at the next environment step. Posterior
+sampling requires a draw that is independent across actors and \emph{held} while its consequences
+play out; this is neither, so it is dithering with a value-weighted shape, and the deep
+exploration the argument assumed is not present to be built on. What survives is the magnitude:
+\S\ref{sec:meas-rho} finds the draw accounting for most of the best soft arm's total exploration
+regret, so \eqref{eq:rule} is a second, undirected layer on top of a first whose character has
+been mis-described. Two nearly free changes would make the description true, and
+they are \S\ref{sec:fixdraw}'s.
+\end{remark}
+
+\section{Case analysis}
+\label{sec:cases}
+
+Ten cases: seven constructed, three this project has observed. Each is stated, then what it
+demands, then which candidates fail it. \eqref{eq:rule} is on the list as (F), already stated, so
+that a case can be read as a verdict rather than as a promise.
+
+\paragraph{The candidates.} Each is a map from $\tilde{q}(s,\cdot)$ to a distribution over
+actions.
+
+\begin{description}
+  \item[(A) A fixed sharpness constant.] $\pi = \sm(\tilde{q}(s,\cdot)/\tau)$ with $\tau$ a
+  number in the source. The status quo, at $\tau = \texttt{ACT\_TEMPERATURE}$.
+  \item[(A$'$) The same, in normalised units.] $\tau = c\,\snorm$, where $\snorm$ is a
+  running estimate of the dispersion of returns in the buffer --- PopArt's scale --- and $c$ is
+  dimensionless. Everything (A) does, with the value unit divided out once per game instead of
+  never.
+  \item[(B) $\epsilon$-greedy.] The greedy action with probability $1-\epsilon$, uniform
+  otherwise. BTR's own, at a small floor $\epsilon$ after a geometric decay.
+  \item[(C) A fixed absolute regret budget.] The most diffuse $\pi$ with
+  $\rho(\pi;s) \le \rho^\star$, for $\rho^\star$ a constant in value units.
+  \item[(C$'$) The same, normalised.] $\rho^\star = c\,\snorm$.
+  \item[(D) A fixed fractional regret budget.] The most diffuse $\pi$ with
+  $\rho(\pi;s) = c\,\gapbar(s)$: spend a fixed fraction of the regret that is available at the
+  state. The previous revision's recommendation.
+  \item[(E) Argmax.] $\argmax_a \tilde{q}(s,a)$ evaluated on a draw of the parameter noise, which
+  is then the only exploration in the loop. The best-measured arm.
+  \item[(F) \eqref{eq:rule}.] $\tau(s) = \min(\srank(s)/g,\ \gapbar(s)/k_0)$.
+  \item[(I) A contracting scale.] $\tau(s) = \hat{s}(s)/g$ for any per-state signal $\hat{s}$
+  that shrinks as a state is visited: the epistemic spread of a posterior over the action values,
+  the disagreement of an ensemble, or a novelty score carried into value units. (I) is a family
+  and not a proposal --- it is carried so that the last two cases have something that passes them
+  --- and what an instance costs is \S\ref{sec:readmit}.
+\end{description}
+
+An entropy target \textbf{(G)}, $\h(\pi)(s) = \bar{\h}$, which is SAC's constraint, is carried
+until \S\ref{sec:c3} decides it. \emph{A primed candidate inherits its sibling's verdict except
+where a case says otherwise}, which happens three times: \S\ref{sec:c1}, where the normaliser is
+the whole point, and \S\ref{sec:c5} and \S\ref{sec:c6}, where it is measurably not enough.
+
+For (C), (C$'$) and (D), note once that a maximum-entropy policy subject to a linear constraint
+$\E_\pi[\gap] = \rho^\star$ \emph{is} a Boltzmann distribution, with the scale as the
+constraint's Lagrange multiplier. So they are not alternatives to a softmax; they are a softmax
+whose scale is solved per state rather than chosen. That framing is what makes them comparable to
+(A) on the same axis, and it is one more reason that whichever scale wins should reach the loss
+as a temperature and not as a solved constraint (\S\ref{sec:decouple}): a dual variable is not a
+modelling coefficient.
+
+\subsection{Invariance under reward rescaling}
+\label{sec:c1}
+
+\emph{Demand.} The behaviour policy is unchanged. Nothing about the decision problem changed;
+only the unit did.
+
+(A) fails outright --- $\sm(100\tilde{q}/\tau)$ is a hundredfold sharper --- and this is the
+\texttt{ACT\_TEMPERATURE} complaint in its purest form. (C) fails the same way from the other
+side: a fixed regret budget is a hundredth of the available regret after rescaling, so the policy
+sharpens. (B) and (D) pass by construction, being defined on rates and ratios respectively.
+
+\emph{This is the case the primed candidates exist for, and they pass it.} $\snorm$ is a
+dispersion of returns, so it scales with the reward unit and $\tau = c\,\snorm$ and
+$\rho^\star = c\,\snorm$ both scale with it. The pass is exact in the limit and approximate in
+practice, since $\snorm$ is an estimate from returns already in the buffer and therefore lags
+a change of unit by however long the buffer is --- which is a real effect over a run, where the
+scale a game's returns are measured on moves as the agent gets better at it. \S\ref{sec:norm}
+prices the normaliser; this case is what buys it.
+
+(F) passes exactly and unconditionally: $\srank$ is a spread of the critic's own outputs, so it
+is homogeneous of degree one in the reward unit, and $\tilde{q}/\srank$ is invariant. This is the
+one place the change of denominator buys something for nothing --- the previous revision's
+$\dbar$ passed here only \emph{conditionally}, on $\snoise$ tracking the value scale, because the
+parameter noise is a separate quantity that the reward unit does not reach. \S\ref{sec:denoms}
+measured that condition and it does not hold.
+
+(E) inherits the same conditional and keeps it, the draw being the whole of its exploration. Two
+things soften that: the failure is toward \emph{sharpness}, which costs return at the margin and
+cannot destabilise, where (A)'s and (D)'s failures below are toward diffuseness; and (E) is the
+best-measured arm as it stands.
+
+(I) passes when its signal is in value units --- an epistemic spread of the action values is, and
+rescales with them --- and fails when it is not. A count, a pseudo-count or a novelty score is a
+number about states, not about returns, so an instance built on one needs a carrier to multiply
+it into value units, and then it is that carrier and not the signal that has to pass this case.
+This is the $\ddagger$ on (I) throughout, and \S\ref{sec:contracting} is where the carrier is
+chosen.
+
+\subsection{Invariance under duplicated actions}
+\label{sec:c3}
+
+\emph{Demand.} The marginal behaviour over distinct actions is unchanged, and the constant does
+not have to be retuned. This is not hypothetical: Zaxxon's action set is five directions crossed
+with fire and aliases heavily, which is most of why \S\ref{sec:denoms} finds its top-two gap so
+far below Phoenix's --- a factor that is partly the action set and not the task.
+
+Every regret-based rule passes. $\gapbar$ is invariant under duplication --- each value is
+counted twice in a mean over twice as many actions --- and a Boltzmann policy's marginal over
+distinct actions is the Boltzmann policy over distinct actions at the same scale. So (A), (B),
+(C), (D), (E), (F) all pass, and so do the primed variants, $\snorm$ being a property of
+returns and not of the action set. (I) passes for the same reason as (F): every statistic in it
+is a mean over actions, and whatever a posterior or an ensemble says about an action it says
+identically about that action's twin.
+
+What this case decides is what is \emph{not} on the list. \textbf{(G), an entropy target, fails}:
+$\h$ ranges over $[0, \ln 2m]$ where the decision problem has $m$ distinct actions, so a target
+in nats is a different policy before and after duplication, and SAC's $\bar{\h}$ is exactly such
+a target. And \textbf{a calibration read off the top-two gap fails}: a duplicated argmax drives
+that gap to zero at unchanged behaviour, so $\tau = \mathrm{gap}_{\mathrm{top2}}/k$ --- the rule
+\texttt{docs/plan.md} currently proposes --- collapses. Both are excluded here and do not appear
+again.
+
+\subsection{Added dominated actions}
+\label{sec:c4}
+
+\emph{Setup.} The same decision problem with $16$ further actions bolted on, all worse than
+everything already there: one best action and the rest at a common gap $\delta$.
+
+\emph{Demand, stated carefully, because the obvious statement of it is wrong.} Sixteen unpriced
+actions have to be tried before anything can be said about them, and trying them costs
+exploration --- that cost is the problem's and every rule pays it. A Boltzmann policy pays it in
+the cheapest available order, spending most on whatever it currently rates highest among the
+unknowns; that is what value-weighting is for and no case here objects to it. What a rule may not
+do is \emph{go on} paying once the answer is in. So the demand is at fixed knowledge: with the
+critic having resolved that the added actions are worse, enlarging the action set must not make
+the policy more diffuse than it was on the original set.
+
+This is \S\ref{sec:c3}'s matched pair and it is where the two part company. With one best action
+and the rest at a common gap $\delta$, $\gapbar = \delta(|\actions|-1)/|\actions|$: that is
+$0.500\delta$ at $|\actions| = 2$, $0.875\delta$ at $8$ and $0.944\delta$ at $18$. So
+\textbf{(D) fails}. Its target $c\,\gapbar$ inflates by $1.75\times$ from two actions to eight,
+and since regret is spent at $\delta$ per unit of off-greedy mass, the off-greedy probability
+inflates with it --- permanently, because the added actions stay bad and so $\gapbar$ stays
+inflated. The rule explores more because more bad options exist, long after it has established
+that they are bad.
+
+That is the same objection the previous revision raised against entropy and against the top-two
+gap --- that they are functionals of the \emph{action set} rather than of behaviour --- turned
+back on the statistic it then built its own target out of. $\gapbar$'s invariance is exactly
+duplication-invariance and no more.
+
+(C) and (C$'$) pass: a budget in value units does not read the action set at all. (B) passes on
+the stated demand, its off-greedy rate being $\epsilon$ regardless, though the \emph{cost} of that
+rate rises as the added actions are worse and uniformly drawn --- which is \S\ref{sec:c2}, not
+this case. (A), (A$'$), (F) and (I) are all mildly exposed: more actions means more terms in the
+softmax's tail, so the off-greedy rate rises linearly in the count at fixed scale. That is an
+acceptable residue and it is the standard behaviour of a Boltzmann policy, not a defect
+introduced by this design. Whether (F) is exposed \emph{more} than (A) depends on what the added
+actions do to $\srank$, which is a mean over actions and so does move when the action set does;
+confidently bad actions have narrow orderings and pull it down, which sharpens, but this has not
+been measured and the verdict is the same either way. (I) moves the same way and for the same
+reason: a resolved bad action has little epistemic spread, so the mean falls and the policy
+sharpens.
+
+\subsection{Catastrophic actions}
+\label{sec:c2}
+
+\emph{Setup.} $|\actions| = 2m$; $m$ actions return $-M$ immediately for large $M$; the other $m$
+differ among themselves by a small $\delta$ and are what precise control is about.
+
+\emph{Demand.} The probability of taking a catastrophic action falls as $M$ grows. A rule that
+takes it at a rate independent of $M$ is not making a trade-off, it is ignoring one.
+
+$\gapbar \approx M/2$, dominated entirely by the actions to be avoided. Regret can only be spent
+in quantity by putting mass on them, so a target of $c\,\gapbar$ forces $p_{\mathrm{bad}}\cdot M
+\approx c M/2$, that is \textbf{$p_{\mathrm{bad}} \approx c/2$ regardless of $M$}: (D) fails,
+and it fails for a structural reason --- $\gapbar$ is inflated by precisely what makes the state
+dangerous, so the rule reads ``much regret is attainable here'' and spends it. (B) fails
+identically at $p_{\mathrm{bad}} = \epsilon/2$.
+
+(A) passes, $p_{\mathrm{bad}} \propto e^{-M/\tau} \to 0$; this is value-weighting doing its job
+and it is what a Boltzmann policy is for. (C) passes and is the most precisely right of them:
+$p_{\mathrm{bad}} \approx \rho^\star/M$, so the mistake gets rarer at exactly the rate that keeps
+its cost constant. (E) passes. (F) passes, because its operating branch does not read $\gapbar$
+at all: $\tau = \srank/g$, and an action that is confidently catastrophic has a return
+distribution that is confidently at $-M$, contributing nothing to the spread of the ordering. So
+$p_{\mathrm{bad}} \propto e^{-Mg/\srank} \to 0$, and the floor branch does not bind,
+$\gapbar/k_0 \approx M/2k_0$ being enormous. (I) passes by the same two steps: a resolved
+catastrophe has no epistemic spread either, and the exponential does the rest.
+
+\emph{This case and \S\ref{sec:c4} together retire (D)}, which is the previous revision's
+recommendation, and they retire it on the same mechanism seen twice: a target proportional to the
+attainable regret is a target proportional to how bad the worst options are.
+
+\subsection{Two regions at different reward scales}
+\label{sec:c5}
+
+\emph{Setup.} Room 1 rewards precise control and the agent has learned it; room 2 rewards
+exploration, tolerates mistakes, and its rewards are $1000\times$ larger. One game, one network,
+two regions of its state space.
+
+\emph{Demand.} Sharp in room 1, diffuse in room 2, from one setting.
+
+(A) fails hardest, and this is the case the whole per-state idea exists for: one $\tau$ against
+gaps that differ by $1000\times$ is near-argmax in one room and near-uniform in the other, and no
+value is right for both. That is not a thought experiment on this codebase --- it is the
+value collapse \S\ref{sec:meas-collapse} records --- a Phoenix run whose \texttt{train/q} fell
+while the policy went near-uniform --- in miniature.
+
+\textbf{(A$'$) fails too, and this is the limit of normalisation.} $\snorm$ is one number for
+the whole game, estimated from returns pooled over both rooms, so $\tau = c\,\snorm$ is one
+temperature again --- the right one nowhere and wrong by up to $1000\times$ somewhere. A global
+normaliser converts a constant that is wrong across games into a constant that is wrong across
+states within a game, which is progress and is not the case. (C$'$) inherits it: its budget is
+infeasible in the poor room for the same reason (C)'s is.
+
+(C) is sharp in the rich room and infeasible in the poor one ($\rho^\star > \gapbar$ has no
+solution, and the previous revision's simulation finds its sharpness near-uniform and
+essentially uncorrelated with the state once the gaps contract). (B) and (D) are \emph{equally}
+sharp in both rooms, which is not what the case asks for but is bounded: they turn a
+$1000\times$ error into a constant-factor one, which is the honest size of what scale-freeness
+alone buys.
+
+\textbf{(F) passes, and so does (I)}; the reason is worth isolating because it is the document's
+central claim. What the case actually asks is that sharpness track \emph{how much exploring is
+worth}, and that is not a property of the value scale at all. $\srank$ carries both: it is a
+spread of that room's own values, so it moves with the room's reward scale, \emph{and} it is the
+spread of the \emph{ordering}, so it moves with how far the network is from having resolved which
+action is best there. Room 1 is learned, so the gaps are large against $\srank$ and the policy is
+sharp; room 2 is not, so they are not and it is diffuse. Neither response is tuned. (I) passes
+for the second half of that sentence alone, and more directly: an epistemic signal is exactly a
+measure of how much is left to learn in the room.
+
+The mechanism is not assumed here, which it was in the previous revision. $\gapbar/\srank$ reads
+measurably higher on the argmax-trained net than on the soft-trained one
+(\S\ref{sec:denoms}) --- so the net whose ordering is better resolved, and which scores higher, is
+the one the rule acts more sharply on, with no constant changed.
+That is this case's demand observed between two real checkpoints rather than between two
+imagined rooms.
+
+\emph{What $\srank$ does not carry} is which of the two reasons a room is diffuse: a state whose
+ordering is unresolved because it is unvisited and one whose ordering is unresolved because the
+return is genuinely noisy look the same to it. That is \S\ref{sec:c10}, and it is the price of a
+denominator that costs nothing.
+
+\subsection{Uninformative value functions: initialisation and collapse}
+\label{sec:c6}
+
+\emph{Setup.} All $\tilde{q}$ are near-equal --- at initialisation, or after a value collapse.
+
+\emph{Demand.} The policy does not become uniform, and in particular the rule does not
+\emph{amplify} the contraction: the policy it produces at contracted gaps is the policy it would
+produce at the same gaps scaled up.
+
+\emph{Why uniform is the wrong answer here, since it is not obvious.} The objection to make is
+that a critic which knows nothing cannot direct anything, so a uniform random walk is the best
+available exploration. For a bandit, or a short horizon, or an agent with an intrinsic-motivation
+term to direct it instead, that is correct. It is not correct here, for two reasons that are
+properties of the problem and not of the rule. First, reward in these games is reached by
+committed sequences of actions rather than by single ones, so a policy that redraws uniformly at
+every one of $H = 333$ steps reaches it with probability $|\actions|^{-L}$ for a sequence of
+length $L$ --- zero in practice for Enduro's ``hold accelerate'', and small enough on Phoenix to
+matter. The returns such a policy collects differ only by noise, the critic fits that, the gaps
+do not grow, and the loop closes: Munchausen's Appx.~B.2 reports exactly this state on Enduro
+($Q$ near zero, a softmax ``very close to uniform''), that the agent gathers no reward, receives
+no signal, and never recovers. This project has the mid-run form on Phoenix, quoted above, with
+\texttt{eval/returns} flat for tens of millions of frames (\S\ref{sec:meas-collapse}). Second,
+the critic at a collapse is not
+uninformative, only quiet: an ordering with small gaps still ranks the actions, and uniform is
+the one map that discards all of it. There is no intrinsic-motivation term in this loop
+(\S\ref{sec:contracting}), so the critic is the only thing directing the actor, and a rule that
+turns a small signal into no signal leaves nothing driving the run.
+
+(A) fails: this is the Enduro failure and the observed collapse, and it is self-reinforcing.
+(C) fails: $\rho^\star$ becomes infeasible as $\gapbar$ contracts under it, and the most diffuse
+policy meeting an infeasible budget is the uniform one.
+
+\textbf{(A$'$) and (C$'$) fail, and the normaliser is what makes them interesting anyway.}
+$\snorm$ is estimated from returns in the buffer, not from the network, so it does not
+contract when the network's outputs do: the gaps shrink under a fixed $\tau = c\,\snorm$ and
+the policy goes uniform, exactly as (A) does. But that is also the only way to \emph{see} the
+collapse --- \S\ref{sec:norm}'s third use --- because every rule that passes this case passes it
+by being blind to the difference between a fine-grained game and a dead value function.
+
+\textbf{(D) passes, and this is the one case it is built for and wins.} It is exactly
+scale-invariant against the perturbation $\tilde{q} \to \varepsilon\tilde{q}$: every gap and
+hence the target scales by $\varepsilon$, the solution scale moves to $\varepsilon\tau$, and
+$\sm(\varepsilon\tilde{q}/\varepsilon\tau)$ is the \emph{same} policy. The loop's gain is zero.
+It does not push back against a contracting value function; it declines to amplify the
+contraction, which is enough that the collapse cannot compound.
+
+\textbf{(F) passes, and it is the change of denominator that makes it do so.} Both $\tilde{q}$
+and $\srank$ are outputs of the same network, so under $\tilde{q} \to \varepsilon\tilde{q}$ the
+scale moves to $\varepsilon\tau$ and $\sm(\varepsilon\tilde{q}/\varepsilon\tau)$ is the
+\emph{same} policy: (F) has (D)'s zero loop gain, exactly, and by the same argument. The previous
+revision's $\dbar$ did not --- the parameter noise is not a function of the collapsing outputs,
+so as the gaps contracted under it the ratio $\gapbar/\dbar$ went to zero and the branch asked
+for a near-uniform policy, which is operationally fatal whatever its epistemic merit. Stating the
+rule on a spread of the critic's own outputs is what collapses the two failure modes into one
+denominator.
+
+(I) passes on the same condition it carried at \S\ref{sec:c1} and for the same reason: an
+epistemic spread of the network's own action values contracts with them and the loop gain is
+zero, while a novelty score does not contract with them and its carrier decides the case. (E) is
+exposed here in principle and much less in practice --- \S\ref{sec:meas-return} scores the
+argmax arm well above every soft arm over exactly the frames where collapse lives, with the
+identical parameter noise --- so
+whatever the draw does early, adding an undirected softmax on top of it is what costs the budget.
+
+\emph{The floor survives this reasoning, with a smaller job.} $\gapbar/k_0$ is no longer the only
+scale-free thing in the rule and no longer carries \S\ref{sec:c6} on its own; it is a guard
+against $\srank$ itself failing (\S\ref{sec:rule}), and \S\ref{sec:meas-k} sets it where it does
+not bind.
+
+\subsection{The horizon: regret rather than off-greedy rate}
+\label{sec:c7}
+
+\emph{Setup, at two ends.} Fix an off-greedy probability $p$ per step and ask what it costs over
+an episode of $H$ steps.
+\emph{(i)} On states where the actions are near-tied, so that each off-greedy action is taken at
+a gap of essentially zero.
+\emph{(ii)} On a state where one action must be repeated: action $R$ pays $1$ per step, action
+$N$ pays nothing, and the episode lasts $T$ steps, so the optimal return is $T$ and a policy that
+takes $R$ with probability $1-p$ scores $(1-p)T$. With no time limit both policies diverge and
+the two separate only under discounting, where the gap is $\tilde{q}(s,R) - \tilde{q}(s,N) = 1$
+exactly.
+
+\emph{Demand.} The quantity held fixed across states may not be the off-greedy rate. In (i) the
+rate is nearly free, so a fixed one is a tax that buys nothing wherever the state is already
+resolved; in (ii) the same rate is paid in full and linearly in the horizon, and the agent scores
+a fixed fraction of the maximum forever. No single $p$ is right for both. What separates them is
+\emph{not} the horizon: the cost at either end is $p\,\gap\,H$, and $H$ is common to every state,
+so it cancels from any comparison between them. What does not cancel is the price of one
+off-greedy action, which is the gap. So the currency is regret, $p$ weighted by what it costs,
+and a rule that controls $p$ directly is controlling the wrong number.
+
+\emph{(i) retires a criterion, and it is the criterion the horizon tempts one into.} If what
+mattered were executing an intended trajectory intact, the quantity to hold would be $(1-p)^{H}$,
+and at any $H$ of this size that is negligible for every $p$ an exploring agent could want: an
+agent that requires clean trajectories cannot explore at all. \S\ref{sec:meas-rho} confirms the
+premise --- no arm this project has run comes close to a clean trajectory, and all of them work
+--- so trajectory purity is not the currency. Regret is, and the same measurement prices it:
+$\epsilon$-greedy costs an order of magnitude more than a softmax at a comparable rate, because
+$\epsilon$ selects uniformly among exactly the actions the value function holds unlikely.
+
+\emph{(ii) is Phoenix's own shape}, a game whose optimal policy is to keep firing, and it is
+carried for one reason: it bounds (i)'s reading. ``The rate is nearly free'' is a measured fact
+about the states this agent visits and not a general one, and a rule calibrated to a rate that is
+free at a near-tie will pay that same rate at a state where it is worth $p\,T$.
+
+\emph{What (ii) separates, and it is a separation of form rather than of degree.} A Boltzmann
+rule puts $p_N = (1 + e^{\gap/\tau})^{-1}$ on the wrong action, which is \emph{exponentially
+small} in $\gap/\tau$; $\epsilon$-greedy puts $\epsilon(1-1/|\actions|)$ there, which does not
+depend on $\gap$ at all. At a state whose gap is large in units of the temperature the two are
+not close, and they are not close by a factor that grows without bound as the gap does. That is
+the whole of it: \textbf{a rate that answers to the gap against a rate that does not}, and (ii)
+is the construction that makes the difference unbounded rather than merely large.
+
+\eqref{eq:rule} collapses here for a second and independent reason worth stating, because it is
+exact rather than exponential. The returns in (ii) are deterministic, so every action's
+distribution is a point mass, hence a translate of one shape; by \S\ref{sec:bg}'s zero set
+$\srank = 0$, so $\tau = 0$ and the rule is argmax at this state \emph{by construction}, paying
+nothing at all. (E) collapses too, the gap being large against the parameter draw's own spread.
+(C) does pay, at $p_N = \rho^\star/\gap$, but that is the budget it was handed rather than a
+failure of this case.
+
+So (ii) separates exactly one candidate, and it is the cleanest of the three places this document
+retires it: no large $M$ as in \S\ref{sec:c2}, no measurement as in (i), only a gap and a horizon
+to pay it over. What (ii) does \emph{not} do is separate any two \emph{survivors} --- all of them
+are Boltzmann or argmax and all of them lose exponentially little here --- so it is no help in
+choosing a denominator, which is this section's other job. Whether the loss falls once the
+ordering has been resolved is \S\ref{sec:c11}'s question and not this one.
+
+\textbf{This retires (B).} $\epsilon$-greedy prices no action, so it pays a rate the gap cannot
+talk it out of: $\epsilon(1-1/|\actions|)T$ of the score in (ii), and in (i) an order of magnitude
+more regret than a softmax at a matched rate (\S\ref{sec:meas-rho}). \S\ref{sec:c2} is the same
+fact in its extreme form. It is also why
+every surviving rule is a Boltzmann policy: value-weighting is the cheap way to buy a rate.
+Everything else on the list passes, being either a Boltzmann policy or argmax.
+
+\subsection{Exact ties}
+\label{sec:c9}
+
+\emph{Setup, in two variants, because they are not the same state.}
+\emph{(i) Exact ties}: several actions have identical return distributions --- a no-op
+duplicated, a direction the game ignores in this state.
+\emph{(ii) Mean ties}: the actions have equal means and different distributions --- one is a
+gamble and another is certain --- and the critic has resolved that this is so.
+
+\emph{Demand.} The rule is well defined in both, and without a branch. At (i) every policy over
+the tied actions is the same policy, so anything is correct and the only failure available is to
+be undefined. At (ii) the means are equal but the actions are not, and the case asks the weaker
+question of whether the rule notices.
+
+(A) gives a uniform policy over tied actions in both, which is harmless. \textbf{(D) is
+degenerate in both}: $\rho(\pi;s) = 0$ for \emph{every} policy, since $\rho$ reads the means, so
+$\rho(\tau;s) = c\,\gapbar(s)$ reads $0 = 0$ and every $\tau$ in the bracket satisfies it. The
+previous revision's bisection returns an arbitrary point, and under coupling that arbitrary
+number multiplied the Munchausen log-policy. (C) and (C$'$) are infeasible rather than
+degenerate, which is a softer failure with the same outcome.
+
+(F) is well defined without a branch. At (i) identical actions have identical return
+distributions, so $\srank = 0$ and $\tau = 0$ is argmax over tied values --- arbitrary, but
+arbitrary among identical things, and no root-find exists to be degenerate. At (ii) $\srank > 0$
+and the rule samples over them. (I) is also well defined and does the opposite at (ii): the case
+says the critic has resolved the distributions, so there is no epistemic spread left and (I)
+plays argmax. The case does not say which is right --- sampling among mean-tied actions collects
+information about their distributions, and if that information is already in hand it buys nothing
+--- and it is worth recording as the one place where (F) and (I) disagree about behaviour rather
+than about price.
+
+This is a small case with one large consequence: it is the second of two reasons (with
+\S\ref{sec:rule}'s cost) to state the rule as a scale computed directly rather than as a
+constraint solved numerically.
+
+\subsection{Learned states with irreducible noise}
+\label{sec:c10}
+
+\emph{Setup.} The ordering at $s$ is settled and the network knows it, but the return from $s$
+is genuinely variable --- sticky actions, a bonus that sometimes lands, anything the agent does
+not control.
+
+\emph{Demand.} The policy is sharp. Variance the agent cannot reduce is not a reason to try
+other actions. This is the distinction between not knowing which action is best and knowing it
+while the outcome stays uncertain, and every rule above that reads a spread is at risk of
+confusing the two.
+
+(A), (A$'$), (B), (C), (C$'$) and (D) pass by not looking: none of them reads a spread of the
+return at all. (E) is exposed in principle --- $\snoise$ is fitted by gradient on a loss whose
+residual is inflated by exactly this noise --- and there is no measurement either way. (I) passes
+by construction, since an epistemic signal is defined as the part that contracts with data and
+irreducible noise is the part that does not; that is the whole reason the family is carried.
+
+\textbf{(F) passes for action-independent risk and fails for heteroscedastic risk}, and the
+split is what chooses between the two free denominators. Risk the action does not control enters
+$Z(s,\cdot)$ as a common term, which the dueling head puts in the value stream and the centred
+advantage removes, so $\srank$ does not see it and $\sret$ sees nothing else. A gamble that one
+particular action takes does move $\srank$, and there the rule diffuses when it should not. So
+$\sret$ is retired as an operating denominator here and kept only as a unit (\S\ref{sec:norm}),
+and $\srank$'s residual exposure is the honest price of a statistic that costs two reductions.
+
+\emph{The exposure is wider than a gamble, and \S\ref{sec:bg}'s zero set says how much.} What
+the centring removes is a common \emph{translation}, so what survives is every departure from a
+location family --- not only an action whose outcome is a gamble, but any action whose return
+has a different \emph{shape} from its neighbours', including one that dominates them at every
+risk level. A settled ordering is therefore not sufficient for $\srank$ to be small. That the
+rule nonetheless transfers (\S\ref{sec:denoms}) is a measurement and not a consequence of the
+definition, which is the right way round for the claim most worth breaking.
+
+Nothing free passes this case \emph{because} it separates the two uncertainties; (F) passes the
+part of it that the architecture happens to separate for free. Doing it on purpose turns out to
+cost two draws rather than a head --- \eqref{eq:uasplit} estimates both halves without bias from
+two posterior samples of the same network --- so the price of this case is
+Remark~\ref{rem:peraction}'s, not \S\ref{sec:contracting}'s.
+
+\subsection{Repeated visits to a resolved state}
+\label{sec:c11}
+
+\emph{Setup.} A state visited over and over, its ordering unchanged, its returns collected.
+
+\emph{Demand.} Sharpness rises. An exploration rate that does not anneal is a tax with no term,
+and at a full budget the late fraction of the run is where most of the score is.
+
+(A) and (A$'$) fail: a constant is a constant, and a constant in normalised units is a constant.
+(B) anneals, but on a clock rather than on the state, and BTR's geometric decay is the reason its
+arms are competitive early --- a schedule is a real answer to this case and it is the only thing
+in the project that has ever given one. (C), (C$'$) and (D) fail: they read gaps, and the gaps at
+a converged state stop moving.
+
+\textbf{(E) and (F) fail, and this is measured rather than argued.} Across Phoenix checkpoints
+spanning most of a budget, \S\ref{sec:denoms} finds both $\dbar$ and $\gapbar/\srank$ flat.
+Neither
+the parameter draw nor the quantile spread contracts with data on this codebase. The rule
+therefore holds a constant \emph{relative} sharpness for a whole run, which is better than a
+constant absolute one and is not annealing.
+
+Only (I) passes, and only because contraction is what a posterior, a count or an ensemble's
+disagreement is \emph{for}: they go as $1/\sqrt{n}$ where nothing above goes at all. Fox's
+closed-form temperature (\S\ref{sec:related}) passes it by construction for the same reason, its
+denominator being the epistemic variance of the gap, which falls as $1/n$.
+
+What the case costs is decided by Remark~\ref{rem:peraction} rather than by this document. Given
+draws that are actually posterior samples, the epistemic half $\tilde\sigma_{\mathrm{epi}}$ of
+\eqref{eq:uasplit}'s two-draw split is a contracting per-state signal for one extra pass through the output layers. Given the draws as
+they are wired, it is not, and then the case needs a head. \S\ref{sec:readmit} is ordered
+accordingly.
+
+\subsection{Summary}
+\label{sec:summary}
+
+\emph{(A)} fixed sharpness, the status quo; \emph{(A$'$)} the same in normalised units;
+\emph{(B)} $\epsilon$-greedy; \emph{(C)} a fixed absolute regret budget; \emph{(C$'$)} the same,
+normalised; \emph{(D)} a fixed fractional one, two revisions ago's recommendation; \emph{(E)}
+argmax with the parameter draw, the best-measured arm; \emph{(F)} \eqref{eq:rule}; \emph{(I)} a
+rule scaled by something that contracts with visitation.
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{lccccccccc}
+  \toprule
+  case & (A) & (A$'$) & (B) & (C) & (C$'$) & (D) & (E) & (F) & (I) \\
+  \midrule
+  \S\ref{sec:c1} rescaling        & \no  & \yes & \yes & \no  & \yes & \yes & \meh$^\dagger$ & \yes & \meh$^\ddagger$ \\
+  \S\ref{sec:c3} duplicates       & \yes & \yes & \yes & \yes & \yes & \yes & \yes & \yes & \yes \\
+  \S\ref{sec:c4} added actions    & \meh & \meh & \yes & \yes & \yes & \no  & \meh & \meh & \meh \\
+  \S\ref{sec:c2} catastrophic     & \yes & \yes & \no  & \yes & \yes & \no  & \yes & \yes & \yes \\
+  \S\ref{sec:c5} two rooms        & \no  & \no  & \meh & \meh & \meh & \meh & \meh & \yes & \yes \\
+  \S\ref{sec:c6} uninformative    & \no  & \no  & \yes & \no  & \no  & \yes & \meh & \yes & \meh$^\ddagger$ \\
+  \S\ref{sec:c7} horizon          & \yes & \yes & \no  & \yes & \yes & \yes & \yes & \yes & \yes \\
+  \S\ref{sec:c9} ties             & \yes & \yes & \yes & \meh & \meh & \no  & \yes & \yes & \yes \\
+  \S\ref{sec:c10} learned, noisy  & \yes & \yes & \yes & \yes & \yes & \yes & \meh & \meh & \yes \\
+  \S\ref{sec:c11} revisitation    & \no  & \no  & \meh & \no  & \no  & \no  & \no  & \no  & \yes \\
+  \midrule
+  constants with a value scale    & $1$ & $0$ & $0$ & $1$ & $0$ & $0$ & $0$ & $0$ & $0^\ddagger$ \\
+  extra parameters                & $0$ & $0$ & $0$ & $0$ & $0$ & $0$ & $0$ & $0$ & ${>}0$ \\
+  extra work per step             & --- & scale & --- & solve & both & solve & --- & 2 red. & a head \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+$^\dagger$ conditional on $\snoise$ tracking the value scale --- measured not to,
+\S\ref{sec:denoms}, though (E) fails toward sharpness. $^\ddagger$ a contracting signal is
+generally not in value units, so (I) needs a carrier and is scale-free and collapse-neutral only
+with one; \S\ref{sec:contracting}. ``scale'' is a running return normaliser, ``solve'' a
+per-state root-find, ``2 red.'' two reductions over an array already formed. (G), an entropy
+target, is excluded at \S\ref{sec:c3} and is not carried.
+
+Read down the columns. (A) is the status quo and fails three cases including both that this
+project has observed. (A$'$) buys exactly one of them back and is the measure of what a global
+normaliser is worth on its own: it is the difference between a constant that is wrong between
+games and a constant that is wrong between states. (B) fails the two that are about pricing.
+(C) and (D) fail complementary halves and neither dominates the other --- which is why the
+previous revision's move from (C) to (D) fixed \S\ref{sec:c6} and broke \S\ref{sec:c2}; (C$'$)
+repairs (C)'s rescaling failure and leaves the rest of its column standing. (E) is the
+best-measured arm and fails nothing outright except the last case, which is a result in itself
+and is why \eqref{eq:rule} is built to contain it. (F) is what is left of what is free. The last
+two rows of cases are what is not free, and the last column is the only thing in the table that
+answers them.
+
+\section{Coupling the temperature into the loss}
+\label{sec:decouple}
+
+The question is whether $\tau(s)$ replaces $\tau_\ell$ in the Munchausen target as well as in
+\texttt{\_act}. The previous revision answered yes on principle --- M-DQN's output \emph{is} a
+policy, $\sm(\tilde{q}/\tau_\ell)$ exactly, so acting at any other scale deploys something the
+algorithm did not produce --- and the revision after it answered no, on an objection to the
+objective a state-dependent coefficient induces. That objection is now measured, and it does not
+hold (\S\ref{sec:c8}).
+
+What follows separates two questions the previous revisions ran together. \emph{Is coupling the
+better-posed design?} Yes, and \S\ref{sec:couple-case} says so in four parts, because the rest of
+this section is a list of obstacles and none of them is a defence of the fixed constant.
+\emph{Is it the thing to run next?} No --- for one reason that is about what an experiment could
+conclude and not about the design (\S\ref{sec:c8-staging}). Between the two sits the one obstacle
+that is neither, and it is the only place in this section where something is actually unknown:
+the fixed point (\S\ref{sec:couple-fixedpoint}).
+
+\subsection{The case for coupling}
+\label{sec:couple-case}
+
+\paragraph{The critic's output is a policy at exactly one scale, and decoupling is not playing
+it.} By Proposition~\ref{prop:amp}, $\sm(q_\infty/\tau_\ell)$ is the soft-optimal policy of the
+MDP the loss is solving. Decoupled, the behaviour is $\sm(\tilde{q}/\tau(s))$, which is that
+policy at no scale the loss knows about: the agent solves one problem and plays another, and the
+mismatch is a function of the state. Coupled, the identity is restored state by state and by
+construction --- $\tau(s)$ is the loss's own coefficient at $s$, so the behaviour is the
+soft-optimal policy of the MDP the critic is being fitted to. That is the previous revision's
+principle in full, and nothing measured since has touched it.
+
+\paragraph{It deletes a constant rather than adding one.} Decoupled, the rule needs the ceiling
+$\tau(s) \le \tau_\ell$, and Remark~\ref{rem:erratum} is what makes that bound the right one
+rather than an arbitrary one: $\tau_\ell$ is the scale at which the critic is a policy. Coupled,
+there is no $\tau_\ell$ left to be a ceiling --- the loss's coefficient \emph{is} $\tau(s)$, the
+critic is a policy at $\tau(s)$ by the same proposition, and the bound has nothing left to say.
+So coupling removes \texttt{MUNCHAUSEN\_TEMPERATURE} from the algorithm outright, and with it the
+one constant in the loss that carries a value scale --- which is \S\ref{sec:project}'s standing
+requirement, applied to the one place this document had exempted from it. \emph{And the bound it
+removes is a structurally fragile one.} The fraction of states resting on the ceiling is the
+fraction with $\srank(s)/g > \tau_\ell$, so it is a quantile of the $\srank$ distribution read at
+a threshold set by the loss --- and a quantile taken in the body of a distribution moves far
+faster than the threshold does. \textbf{So the decoupled rule's resting fraction is hostage to a
+constant chosen for the loss's reasons, and not gently}: \S\ref{sec:meas-k} measures a modest
+change in $\tau_\ell$ turning the ceiling from a guard into the branch that decides a large
+minority of actions --- over which \eqref{eq:rule} is the fixed temperature it exists to replace.
+Coupled, the branch does not exist.
+
+\paragraph{The distortion it induces is smaller than the one decoupling already accepts.}
+Both are per-step additive terms in $\tilde{q}$'s units --- $D(s)$ on one side,
+\S\ref{sec:decouple-ledger}'s lost Munchausen cancellation on the other --- so they compare
+directly, and \S\ref{sec:meas-couple} finds $D$ smaller by two orders. In the loss's own units
+there is no argument for the decoupled arm. \emph{That comparison is between two terms in the
+loss and is not a claim that the bonus is behaviourally negligible}; read instead as a standing
+bias on the policy, at the per-decision horizon, the same $D$ is of the same order as this
+project's existing exploration mechanism, which is \S\ref{sec:c8}'s second bullet and the reading
+that bears on where a coupled agent would go.
+
+\paragraph{And it makes the Munchausen clip inert by identity rather than by luck.} The bonus is
+$\alpha\tau\ln\sm(\tilde{q}/\tau)(a) = -\alpha(\gap_a(s) + D(s))$ identically, by
+\eqref{eq:distortion}'s algebra, so $l_0 = -1$ fires iff $\gap_a + D > 1/\alpha = 1.111$ --- a
+condition on gaps in value units, with the temperature cancelled out of it --- so counted over
+state-action pairs the clip is \emph{not} the dead letter the previous revision recorded, and
+\S\ref{sec:meas-couple} says how far from dead. But the loss evaluates the bonus only at the
+action the behaviour took, and there the two conditions collapse into one: the clip needs
+$\pi_\ell(a) < e^{-1/(\alpha\tau_\ell)}$, and when the behaviour shares that temperature this is
+\emph{also} the probability of drawing $a$. \textbf{Coupled, the chance a drawn transition is
+clipped is therefore at most $|\actions|\,e^{-1/(\alpha\tau(s))}$ at every state}, a bound that
+needs nothing measured and is minute at any sharp $\tau$. Decoupled there is no such identity:
+the rate runs through the behaviour's own temperature,
+$\pi_b(a) = \pi_\ell(a)^{\tau_\ell/\tau_b}$, which is safe while $\tau(s) \le \tau_\ell$ and
+degrades as a power of the mismatch above it. The clip is an argument for coupling, and the
+previous two revisions had it backwards in both directions at once.
+
+\emph{So there is no argument against coupling from the objective, from the constants, or from
+the clip.} The three that remain are below, and only the first is about the algorithm.
+
+\subsection{The objective under a state-dependent coefficient}
+\label{sec:c8}
+
+M-VI($\alpha, \tau$) solves the MDP regularised by entropy at $\lambda = (1-\alpha)\tau$, so a
+state-dependent $\tau(s)$ solves one regularised at $\lambda(s) = (1-\alpha)\tau(s)$, and the
+agent's objective gains \eqref{eq:distortion} at every step: \textbf{states with a large $D(s)$
+are literally worth more}. That is not a change of temperature, it is an intrinsic reward, and
+the previous two revisions both stopped there --- they named the reward's \emph{character} from
+the denominator and ranked the candidates on that. Character without magnitude decides nothing,
+and both are now measured (\S\ref{sec:meas-couple}). Three readings, and each moves a claim.
+
+\paragraph{What the bonus is paid on is the near-tie, not the denominator.} $D$ is linear in
+$\tau$ and exponential in $-\gap/\tau$, so the exponential chooses the states and the denominator
+only scales what they get. Weighting each per-state quantity by the bonus it carries,
+\S\ref{sec:meas-couple} finds the mass sitting on states whose top-two gap is far below average,
+while $\srank$'s own concentration is slight on one game and real on the other. So the intrinsic
+reward pays the agent to stand where \emph{the two best actions are nearly tied in mean}, which is
+very nearly the opposite of what the objection charged it with, and which is the cheapest place in
+the state space to be paid to stand: the regret of being wrong there is small by construction. The
+$\srank$ carrier the objection was built on is the weaker of the two wherever both are present.
+
+\emph{This retires the risk-seeking charge and does not retire the case behind it.}
+\S\ref{sec:c10} stands as a case about the \emph{sampling} rule --- a heteroscedastic state gets a
+diffuse policy, which is a real failure of (F) and is why \S\ref{sec:c10} is in the table. What
+does not follow is that coupling converts it into a risk-seeking intrinsic reward, because the
+conversion runs through an exponential that ignores $\srank$ almost entirely.
+
+\paragraph{The magnitude is orders below the cost of not coupling.} Both $D$ and the one lost
+Munchausen cancellation \S\ref{sec:decouple-ledger} accepts are per-step additive terms in
+$\tilde{q}$'s units, so they compare directly; \S\ref{sec:meas-couple} makes that comparison on a
+game where both were measured, and it goes the wrong way for the objection this subsection exists
+to state.
+
+\emph{And the ranking against the previous revision's rule was inverted.} $D$ grows with how
+diffuse a rule is, and \eqref{eq:rule} is calibrated to be sharp where candidate (D) is
+calibrated to be diffuse, so priced on the same states (D)'s induced bonus is the larger by two
+orders --- large enough to match the cancellation \S\ref{sec:decouple-ledger} treats as a real
+cost (\S\ref{sec:meas-couple}). The bullet that condemned this denominator names the one rule in
+the family whose induced bonus is negligible, \emph{because} it is the sharpest, while the rule
+it ranked above sits far above it. The objection was sound and it was attached to the wrong
+candidate.
+
+\paragraph{The channel is gated by the gap, which is the finding that matters.} Whatever a
+coupled rule divides by, it reaches the objective only through \eqref{eq:distortion}, and
+$\h(\pi)$ multiplies it. Push $\tau$ all the way to $\tau_\ell$ at every state --- the most a
+coupled rule bounded that way can ever pay --- and \S\ref{sec:meas-couple} finds the great
+majority of states still receiving under a tenth of the ceiling $\tau_\ell\ln|\actions|$, because
+their gaps are large in units of $\tau_\ell$; under \eqref{eq:rule} itself, nearly all of them.
+\textbf{A state that is genuinely unresolved but
+where the critic is confidently wrong receives nothing.} A reward-level bonus --- RND's, a
+count's --- is not gated that way; it is added whatever the critic believes. This is what
+separates the entropy channel from an intrinsic reward proper, and it is the objection
+\S\ref{sec:coupling} has to answer.
+
+\emph{So the verdict on the three denominators, restated on what was measured.}
+\begin{itemize}
+  \item \emph{With $\tau \propto \gapbar$} --- the previous revision's rule --- $k$ is constant
+  by construction, so $\h$ is roughly state-independent and the bonus really is proportional to
+  the denominator, which \S\ref{sec:meas-couple} confirms: the mass tracks $\gapbar$ and is
+  spread rather than concentrated. The agent is paid to occupy states with a large value spread,
+  and by \S\ref{sec:c2} those are the ones containing the worst actions. This is the one
+  denominator for which the character argument goes through, it is confirmed rather than argued,
+  and its magnitude is too large to rescue it.
+  \item \emph{With $\tau \propto \srank$} --- this document's rule --- substitute the branch into
+  \eqref{eq:distortion} and the answer is closed-form rather than a matter of character. On
+  $\tau = \srank/g$, which \S\ref{sec:meas-couple} finds carries most of $\sum D$,
+  \[
+    D(s) \;=\; \frac{\srank(s)}{g}\,\ln m(s),
+    \qquad
+    m(s) \;=\; \sum_a \exp\!\left(-\,g\,\frac{\gap_a(s)}{\srank(s)}\right),
+  \]
+  exactly. The bonus is \emph{linear} in $\srank$ and, through $m$, \emph{exponential} in every
+  gap measured in units of $\srank$ --- so what it responds to is each action's gap divided by
+  the state's own ordering spread, and not either quantity alone. Where a single runner-up is in
+  contention this collapses to $(\srank/g)\exp(-g\,\gap_2/\srank)$ and \textbf{one ratio decides
+  it}, $\gap_2/\srank$, on which \S\ref{sec:meas-couple} confirms the bonus concentrates far more
+  sharply than on either part of it. Where several are in contention it does not collapse, and
+  \S\ref{sec:meas-couple} measures how often that matters.
+
+  \textbf{So the agent is paid to occupy states where the top two actions are close in mean
+  \emph{relative to how far their ordering swings across the return distribution}} --- where the
+  critic's ranking of the best two is not robust to which part of the distribution it is read at.
+  That is a sharper object than a near-tie, and it excludes the obvious degenerate case: a perfect
+  tie between actions whose returns are translates of one shape has $\srank = 0$, hence $\tau = 0$
+  and $D = 0$, and receives nothing. What is rewarded is a tie the return distribution itself
+  disputes.
+
+  \emph{Two consequences follow, and they are what \S\ref{sec:coupling} has to weigh.} The bonus
+  is delivered through the backup, so it is discounted and propagated: the agent does not merely
+  stand in such states, it comes to value the states that \emph{lead} to them. And $\srank$ is
+  measured aleatoric (\S\ref{sec:c10}) and does not contract with data (\S\ref{sec:c11}), so
+  \textbf{the bonus never extinguishes}. Visiting one of these states resolves nothing about it,
+  because there is nothing there to resolve --- which action is better genuinely depends on the
+  risk level. This is the difference between it and family (I) below, and it is not a difference
+  of magnitude: it is a permanent preference for risk-ambiguous states rather than an exploration
+  bonus that spends itself.
+
+  \emph{Two currencies, and they do not agree.} As a per-step term in the loss $D$ is minute
+  against what decoupling already costs. But $D$ is a per-step \emph{value} term, which is exactly
+  what \S\ref{sec:meas-rho} prices the exploration mechanisms in, and over a horizon $H\,D/Q^\star$
+  is what a standing bias on the policy is worth --- a quantity larger by the factor $H$ and, as
+  \S\ref{sec:meas-couple} measures it, of the same order as this project's entire existing
+  exploration mechanism. Both readings are correct and they answer different questions: the first
+  compares two terms in the loss, the second asks how far the bonus moves the policy. Only the
+  second answers where the agent would go, and the previous revisions quoted only the first.
+
+  \emph{And the risk-seeking charge is reduced rather than retired.} $\sret$ --- the width of the
+  return, which is what the charge was actually about and which no previous revision measured ---
+  does carry some concentration, slight on one game and real on the other
+  (\S\ref{sec:meas-couple}). So the charge was aimed at the wrong quantity on one game and at a
+  weakened version of the right one on the other.
+
+  \emph{And an aliased action set revives it outright, which is the sharpest thing against
+  coupling this denominator.} By \S\ref{sec:bg}, duplicating actions sends
+  $D \mapsto D + \tau\ln(\text{copies})$, and on this branch $\tau = \srank/g$, so the added term
+  is \textbf{exactly proportional to $\srank$} --- the pure $\srank$ bonus the objection
+  described, arriving not from the near-tie mechanism but from how many ways the environment
+  happens to spell the same action. \S\ref{sec:c3} is the case that the \emph{rule} survives this
+  and it does; the coupled \emph{objective} does not. Two things follow. An action set with
+  aliases pays a standing bonus proportional to the denominator wherever the aliased actions are
+  in contention, and \S\ref{sec:c3} already identifies one of this project's two games as heavily
+  aliased --- which is also, and perhaps not by coincidence, the game whose measured $\srank$
+  concentration is the anomalous one (\S\ref{sec:meas-couple}). And the term is not a small
+  correction: \S\ref{sec:meas-couple} prices a single duplication at several times the entire
+  bonus it perturbs. \textbf{So the character of a coupled $\srank$ rule is not a property of the
+  rule alone; it is a property of the rule and the action set together}, and no measurement on one
+  action set settles it for another. That is a reason to want the contracting denominator of
+  family (I), whose induced term carries the same duplication factor but spends it.
+  \item \emph{With $\tau \propto \hat{s}$, a contracting signal} --- the family (I) --- the
+  induced term is propagated exactly as \eqref{eq:rule}'s is, and differs in the one way that
+  matters: it \emph{falls} as the ordering resolves, so the bonus is spent rather than drawn
+  forever. That is the property separating a bonus from dithering, and it is what the bullet
+  above lacks --- not the propagation, which coupling gives either denominator, but the
+  extinction. But it is delivered through the same gated channel,
+  so it is an exploration bonus that arrives only where the critic is already indifferent. That
+  is a weaker instrument than \S\ref{sec:coupling} assumed, it is measurable before any run is
+  spent, and it is now \S\ref{sec:coupling}'s first item rather than its premise.
+\end{itemize}
+
+\begin{remark}[The contraction result, and what it does not cover]
+\label{rem:coupled-ok}
+A state-dependent coefficient breaks nothing so long as it is fixed in advance:
+$T_\Omega q = r + \gamma P \Lambda_\Omega q$ with $(\Lambda_\Omega q)(s) = \lambda(s)\lse(q(s,\cdot)
+/\lambda(s))$ is a $\gamma$-contraction for any $\lambda(s) > 0$, because the argument is pointwise
+in $s$ and regularised-MDP theory asks $\Omega_s$ to be strongly convex at each state and not to
+be the same at every state; and M-VI's fixed point is
+$q_\star = A q_*^{\lambda} - \alpha A v_*^{\lambda}$ uniquely --- $q_*^{\lambda}$ and
+$v_*^{\lambda}$ being the action- and state-values of the MDP regularised at $\lambda$ ---
+with $A = 1/(1-\alpha)$, gap amplification $A$ per state and
+$\sm(q_\star(s,\cdot)/\tau(s)) = \pi_*^{\lambda(s)}$.
+\texttt{scripts/check\_mvi\_gap.py} confirms both to six decimals with $\tau(s)$ spanning a decade.
+\textbf{Both results take $\lambda$ as exogenous}, and a rule that reads $\lambda$ off the
+iterate is not covered by either; \S\ref{sec:couple-fixedpoint} is what that costs and what buys
+it back.
+\end{remark}
+
+\subsection{The fixed point, once the coefficient depends on the iterate}
+\label{sec:couple-fixedpoint}
+
+This is the only obstacle in this section that is about the algorithm rather than about the
+experiment, and it is the reason a coupled arm cannot simply be started.
+
+\emph{What is not covered.} Remark~\ref{rem:coupled-ok}'s script draws its per-state temperatures
+once from a fixed vector and holds them. A coupled rule sets
+$\lambda(s) = (1-\alpha)\srank(q(s,\cdot))/g$, a functional of the very iterate being updated.
+That operator is nonlinear and self-referential and is not the one analysed: pointwise strong
+convexity is a statement about a fixed $\Omega_s$ and says nothing when $\Omega_s$ moves with the
+iterate. There is also a feedback loop whose sign nobody has checked --- a larger $\lambda(s)$
+smooths the values at $s$, which moves $\srank(s)$, which moves $\lambda(s)$. It is confined to
+one state, so it does not compound through the discount, but that is an observation and not an
+argument.
+
+\emph{The cheap sufficient condition, and by how much it misses.} $\lambda\lse(q/\lambda)$ is
+nonexpansive in $q$ in sup norm, and its derivative in $\lambda$ is $\h(\pi) \le \ln|\actions|$,
+so for two iterates
+\begin{equation}
+  \|Tq_1 - Tq_2\|_\infty \;\le\; \gamma\left(1 + \frac{L(1-\alpha)\ln|\actions|}{g}\right)
+  \|q_1 - q_2\|_\infty,
+  \label{eq:couplebound}
+\end{equation}
+with $L$ the Lipschitz constant of $\srank$ in the same norm --- at most $2$ by inspection, a
+centring and a spread each nonexpansive, and never measured. A contraction therefore wants
+\begin{equation}
+  g \;>\; \frac{\gamma\,L\,(1-\alpha)\ln|\actions|}{1-\gamma} \;=\; \gamma L(1-\alpha)H\ln|\actions|,
+  \label{eq:couplegain}
+\end{equation}
+and the shape of that condition is the whole point: \textbf{it is proportional to the horizon}.
+The same $H$ that \S\ref{sec:c7} treats as the reason to price exploration in regret is what
+amplifies a per-state perturbation of the backup here, so at a discount this close to one the
+sufficient gain is orders above anything a behaviour policy would choose --- \S\ref{sec:meas-g}
+calibrates $g$ and \S\ref{sec:meas-couple} evaluates \eqref{eq:couplegain} against it, and they
+do not meet. The bound is crude: it takes the worst case over states and over $\lambda$ at once,
+and it is linear in $1/g$ where the actual sensitivity is exponentially gated (\S\ref{sec:c8}).
+Failing it is not evidence that the scheme diverges. It is evidence that the cheap argument is
+not available, so something has to be run.
+A further gap is worth naming: $\srank$ is a functional of the return \emph{distribution} and
+not of $q$, so even \eqref{eq:couplebound} is an analogy --- the distributional operator
+contracts in a Wasserstein metric, not in sup norm on the means.
+
+\emph{Two things clear it, either sufficient, both cheap.}
+
+\textbf{Read $\tau$ off the target network.} Then $\lambda$ is a fixed function of $s$ between
+synchronisations, every period is exactly Remark~\ref{rem:coupled-ok}'s operator, and the coupled
+scheme is no worse founded than the target network the method already rests on. $\tau(s')$ is
+free --- \texttt{target\_next\_qs} is already in registers in \texttt{\_train\_step}. $\tau(s)$ is
+not: the Munchausen log-policy is read off the \emph{online} pass, deliberately, and a target
+pass over \texttt{obs} is a whole extra trunk evaluation, whose throughput cost
+\texttt{btr.py}'s performance block already measures. That is the honest price of the clean
+version, and it is the first thing to trade against staying decoupled.
+
+\textbf{Iterate it tabularly first.} \texttt{scripts/check\_mvi\_gap.py} already builds random
+finite MDPs and iterates M-VI against entropy-regularised VI; the change is to recompute
+$\lambda(s)$ from the iterate on every sweep instead of drawing it once. Whether the composed map
+converges, to what, and with what dependence on $g$ then stops being a theorem nobody has and
+becomes a measurement that costs minutes. \textbf{If the loss is to carry $\tau(s)$, this is the
+first thing to do} --- before the target-net question, and before any arm. Measuring $L$ is the
+same size of job and makes \eqref{eq:couplebound} quantitative rather than indicative: perturb
+the head's output over replay states and read the induced $\Delta\srank$.
+
+\subsection{Containment of the sharp limit}
+\label{sec:c8-staging}
+
+\eqref{eq:rule} is built to contain arm (E): as $g \to \infty$, $\tau(s) \to 0$ and the rule is
+argmax acting on the parameter draw, which is the best thing this project has run
+(\S\ref{sec:meas-return}). That containment is what makes a negative result cost one run and no
+baseline, and it is the whole staging (\S\ref{sec:staging}). It is a property of the
+\emph{experiment}, not of the rule, and this subsection is the only thing in the section that
+turns on the difference.
+
+\textbf{Coupling destroys it.} Coupled, $g$ is a coefficient in the loss, so $g \to \infty$ sends
+$\lambda(s) \to 0$ and deletes the entropy regularisation the algorithm is defined by: the limit
+is no longer arm (E) but M-DQN at zero temperature, whose bonus has saturated at $-\alpha\gap_a$
+everywhere and whose target is a hard max --- a different algorithm that has never been run. The
+full-budget references stop being the comparison at every $g$, not only at the interesting ones,
+and
+$\tau \to 0$ --- which \S\ref{sec:meas-return} and \S\ref{sec:meas-g} both prefer --- becomes
+inadmissible rather than the limit the rule is designed around. Decoupled, the control path stays
+bit-for-bit and the change is a diff in \texttt{\_act} that reverts by deletion
+(\S\ref{sec:project}).
+
+\emph{One run has tested the premise, at a constant temperature.} Exactly one arm this project
+has run moved \texttt{MUNCHAUSEN\_TEMPERATURE} at all, with the acting temperature aliased to it,
+and \S\ref{sec:meas-return} reports what happened: it leaves the family the other soft arms
+belong to, in the specific sense that the frame shift which overlays each of them onto the
+argmax-only curve does not overlay it, and it finishes the weakest of them. One seed, two factors
+moved at once, and a constant is not \eqref{eq:rule}, so it is not evidence about coupling a
+state-dependent rule. It is evidence for this subsection's premise: \textbf{touching the loss's
+temperature moved the run off the curve the references describe, on the first and only attempt.}
+
+\subsection{Four further obstacles}
+\label{sec:couple-obstacles}
+
+\paragraph{Both constants were calibrated on decoupled nets.} $g \approx 4$ and $k_0 \approx 20$
+are read off the gaps of four decoupled runs (\S\ref{sec:meas-g}, \S\ref{sec:meas-k}), and
+\S\ref{sec:meas-couple}'s figures are a linearisation around a point a coupled scheme would
+leave, since the gaps are exactly what $\tau(s)$ in the loss would move. Nothing offline prices
+that. The branch fractions --- which say whether the rule is operating or resting on a bound ---
+are the first thing to log, under either design.
+
+\paragraph{$\tau(s)$ has to be stop-gradiented by hand.} In \texttt{\_train\_step} the Munchausen
+bonus is already outside the gradient, but the \texttt{stop\_gradient} wraps
+\texttt{action\_log\_probs} and not the temperature multiplying it. A coupled $\tau(s)$ read off
+the online pass enters \emph{outside} that wrapper, and left there it hands the network a
+gradient path into its own regularisation coefficient: the loss can then be reduced by moving
+$\srank$ instead of by fitting the return. Reading $\tau$ off the target network
+(\S\ref{sec:couple-fixedpoint}) closes this as a side effect; the online reading needs the
+wrapper widened deliberately. It is one line, and nothing fails loudly if it is missed.
+
+\paragraph{The loss would estimate $\srank$ from a quarter as many quantile samples.}
+The loss draws fewer quantile samples per state than \texttt{\_act} does, so a coupled
+$\hat\tau(s)$ carries the larger relative sampling error --- of order $1/\sqrt{2(n-1)}$ in the
+sample count $n$, which at this project's two settings is about a factor of two
+(\S\ref{sec:meas-couple}). What that costs is bounded by the same gating as
+everything else here: $\lambda\lse(q/\lambda)$ is convex in $\lambda$ with derivative $\h(\pi)$,
+so noise in $\hat\tau$ biases the backup upward by about $\frac12\Var(\hat\tau)\,d\h/d\lambda$,
+and $\h$ is exponentially small wherever the gaps are large in units of $\tau$. It is second
+order in the sharp regime and it is not second order at the near-ties --- which are exactly the
+states $D$ is paid on. The existing probe measures it at both sample counts.
+
+\paragraph{PER is untouched either way.} Coupling changes the value of a TD error, not how many
+there are or how they are drawn: one loss, one priority per transition, one sampling
+distribution. The previous revision listed this as something decoupling buys. It buys nothing
+here.
+
+\subsection{What decoupling costs}
+\label{sec:decouple-ledger}
+
+\emph{Costs.} The behaviour is not the soft-optimal policy of the MDP being solved. The
+measurable residue is one term: the Munchausen bonus is evaluated at the taken action, so a
+behaviour the loss did not anticipate loses one cancellation, clipped into $[-\alpha, 0]$ and not
+propagated through the discounted sum. \S\ref{sec:meas-couple} measures it across a range of
+behaviour entropies and finds it a fraction of a per cent of \texttt{train/q} --- small, but two
+orders larger than the $D$ that coupling would induce in its place, which is the comparison
+\S\ref{sec:c8} turns on.
+
+Direction matters and bounds it further: acting \emph{sharper} than the loss expects is
+conservative, because the value function anticipates randomness the behaviour will not have;
+acting more diffusely is the Enduro direction. So enforce $\tau(s) \le \tau_\ell$, which is the
+correct ceiling and not an arbitrary one because the critic's output over $\tau_\ell$ is already
+the soft-optimal policy of the MDP being solved (Remark~\ref{rem:erratum}), and log the resting
+fraction.
+
+\emph{The ceiling is slack at the constant in force, and slack by less than it looks.} Where it
+binds the direction is favourable --- $\tau(s) = \tau_\ell$ exactly, the behaviour \emph{is} the
+loss's policy and this ledger's one term is zero there --- so the cost is not that the branch is
+wrong but that it is not the rule, and how much of the time it is not the rule is set by a
+constant this document does not control. \S\ref{sec:meas-k} measures both how slack it is and how
+fast that slack disappears when $\tau_\ell$ moves, and finds a higher gain the cheapest fix.
+
+\emph{Buys.} \S\ref{sec:c8-staging}, and that is the whole of it. The previous revision credited
+decoupling with two further things and neither survives. $l_0$ stays inert because the acting
+temperature is at or below the loss's, not because the two are kept apart --- coupling delivers
+the same inertness as an identity (\S\ref{sec:couple-case}) --- and the clip rate the previous
+revision projected for its own coupled rule was counted over actions uniformly, which is not the
+distribution the loss draws from (\S\ref{sec:meas-couple}). And PER is untouched under either
+design (\S\ref{sec:couple-obstacles}).
+
+\paragraph{Where this leaves it.} On the design, coupling is better posed and this section finds
+nothing against it: the distortion is orders below the term decoupling accepts, it
+removes a constant rather than adding one, and it makes the clip's inertness an identity. What
+stands between it and a run is \S\ref{sec:couple-fixedpoint} and \S\ref{sec:c8-staging} --- one
+open question about the operator, which two cheap checks would settle, and one about what a first
+experiment could conclude. \textbf{The order those imply is to decouple the first arm, because it
+is the one that prices $g$ against references that still apply, and to settle
+\S\ref{sec:couple-fixedpoint}'s tabular check while it runs.} If the composed map converges and
+the target-net reading is taken, the coupled arm is the one to run second, with $g$ measured
+rather than assumed. That is a claim about sequencing. Nothing in this section defends
+$\tau_\ell$ as a constant, and \S\ref{sec:couple-case} is the reason the sequence ends with it
+gone.
+
+\section{Removals from the previous revision}
+\label{sec:dropped}
+
+The previous revision carried four proposals and a supporting apparatus. None of it is in
+\eqref{eq:rule}; \S\ref{sec:readmit} takes some of it back on a different account, which is the
+last two cases rather than the choice of temperature. In descending order of what it cost:
+
+\emph{A fixed grid of $K$ members with a margin criterion}, at $2K$ heads and a parameter cost
+parameters. It was the only proposal with a global guarantee --- within $c$ of the best member of
+the grid --- and it needed a placement that nothing supplies, being a set of constants in value
+units, i.e.\ \S\ref{sec:project}'s second constraint $K$ times over. Retired by \S\ref{sec:meas-return}'s four-arm table
+regardless: it is an apparatus for choosing a level that is worth less than a seed.
+
+\emph{A servo on the marginal value of an octave}, at four heads, a probe policy, a
+difference-parameterisation to keep two output layers calibrated to within a tenth of a per cent,
+and a concavity assumption that the fixed-weight table does not support. Same retirement, plus its
+own: a servo sees a slope, so a non-monotone $J(\tau)$ --- the return of the policy at acting
+scale $\tau$, \S\ref{sec:meas-return} --- gives it several fixed points and it tracks whichever
+branch it started on.
+
+\emph{A servo on exploration regret}, at one scalar head. The cheapest of the three and the only
+one with a monotonicity condition that could be logged rather than assumed. Retired for the same
+reason as the other two, and separately by \S\ref{sec:meas-g}'s arithmetic: without a second value
+head to price the parameter draw, the head-free version saturates on a floor that is worst early
+and decays with $\snoise$, making it a controller whose authority is scheduled by an unrelated
+parameter.
+
+\emph{The fixed fractional-regret rule} --- the previous recommendation --- retired by
+\S\ref{sec:c2}, \S\ref{sec:c4} and \S\ref{sec:c9}. What survives of it is \eqref{eq:rule}'s floor
+branch and the reason for it, \S\ref{sec:c6}, which is a real case that it is the only prior
+candidate to pass.
+
+\emph{The apparatus each of those needed} --- a $\tau$-conditioned network, the residual
+parameterisation, per-member normalisers, the PER reference-member problem, the
+leak-versus-deadband gate, the $n$-step correction for a per-member $Q_\env$, and the
+bisection inversion of the regret --- was in every case a cost of holding several members,
+of servoing a level, or of solving a constraint numerically, and \eqref{eq:rule} does none of the
+three. \textbf{No normaliser is needed to make its constants portable}; that is narrower than the
+previous revision's claim, and \S\ref{sec:norm} says what a normaliser is still for.
+
+\emph{One thing is worth keeping and is not part of the rule.} A scalar $Q_\env$ head ---
+\eqref{eq:qenv} below, one \texttt{stop\_gradient} at the trunk's activations, a negligible
+parameters, off the control path and reversible --- buys three measurements available no other
+way: the amplification ratio $\gapop(Q_\tot)/\gapop(Q_\env)$, which
+Proposition~\ref{prop:amp} predicts settles near $1/(1-\alpha) = 10$ and which is that theory's
+only observable consequence; the residual $\rho_\env - (1-\alpha)\rho_\tot$, which is the
+parameter draw's price in environment value units and is the missing piece of \S\ref{sec:meas-g};
+and $\Cov_{\pi}(Q_\tot, Q_\env)$. It is instrumentation, it is not required by \eqref{eq:rule},
+and it should be built when one of those three is wanted rather than on this document's account:
+\begin{equation}
+  \hat{Q}_\env(s_t,a_t) = R^{(n)}_t + \gamma^{n} \ip{\pi}{Q_{\env,\theta'}}(s_{t+n}).
+  \label{eq:qenv}
+\end{equation}
+
+\section{Extensions readmitted by the last two cases}
+\label{sec:readmit}
+
+\S\ref{sec:c10} and \S\ref{sec:c11} are failed by everything that runs for free, and the second
+of them is the whole late half of a run. The previous revision excluded a head, a servo and a
+normaliser by price. That was the wrong test --- the right one is whether a case demands the
+thing --- and applied to these two cases it lets each back in for a reason the earlier version
+did not have. None of what follows is required by \eqref{eq:rule}, which is why it is a separate
+section and why \S\ref{sec:staging} does not wait on it. One condition applies to all of it:
+a parameter can only be checked through its own output, so whatever one is meant to measure gets
+logged beside it.
+
+\subsection{Fixing the parameter draw}
+\label{sec:fixdraw}
+
+Two changes follow from Remark~\ref{rem:peraction} and neither needs a parameter. Give
+$\varepsilon_{\mathrm{in}}$ and $\varepsilon_{\mathrm{out}}$ a batch axis, so that the
+environments explore independently instead of being an ensemble of one; and derive the draw from
+a key folded on a per-environment episode counter, so that it is held while its consequences play
+out. The first is a per-sample product where there is now a broadcast. The second needs the
+terminal flags the loop already handles.
+
+This was the cheapest item before the reading and it is the gating item after it, because three
+separate things turn out to rest on the draws being posterior samples: \S\ref{sec:c10}'s split
+and \S\ref{sec:c11}'s contracting signal, both through \eqref{eq:uasplit}, and the claim ---
+which Dabney et al.\ make on the whole NoisyNets family (\S\ref{sec:related}) --- that this kind
+of exploration is temporally persistent at all. If the draw is fixed, the two cases that nothing
+free passes become affordable at one extra output-layer pass. If it is not worth fixing, then
+dropping \texttt{NoisyLinear} returns a large fraction of the parameters and makes the behaviour
+policy the
+only exploration mechanism in the loop, which is the condition under which $\rho$ becomes
+directly measurable instead of resting on a floor that is most of itself
+(\S\ref{sec:meas-rho}).
+
+\emph{And there is a third option that skips the question.} $\epsilon z$-greedy buys temporal
+persistence with no network change at all, by repeating the exploratory action for a
+heavy-tailed duration (\S\ref{sec:related}). It is cheaper than either branch above and it is
+the control that a persistence experiment should be run against, since if repeating a uniform
+action for $\zeta$-distributed durations recovers whatever a held parameter draw buys, the
+parameter draw is not what was needed.
+
+\subsection{The cost of a contracting signal}
+\label{sec:contracting}
+
+\S\ref{sec:c11} asks for something that goes as $1/\sqrt{n}$. In descending order of cheapness,
+and the first is new since the reading:
+
+\emph{(0) Two draws of the existing head}, through \eqref{eq:uasplit} --- \textbf{measured, and
+it does not work as things stand}. One extra pass through the output projections returns the
+epistemic and aleatoric halves separately and without bias, which is \S\ref{sec:c10} and
+\S\ref{sec:c11} at once, and it costs no parameters. \S\ref{sec:denoms} ran it: the estimator
+behaves (its covariance term is positive everywhere, and it agrees with the naive one on the
+aleatoric half closely), and the epistemic half it recovers is flat across a run and fails to
+transfer across checkpoints (\S\ref{sec:denoms}). So the failure is located: it is the draws, not
+the
+readout. This is the cheapest thing on the list and it becomes the whole of \S\ref{sec:c11}'s
+answer the moment \S\ref{sec:fixdraw} lands --- and only then.
+
+\emph{(a) A last-layer posterior.} Treat the $512$-wide activation as a fixed basis and keep a
+Gaussian posterior over the head weights, updated in closed form; act on a draw held for an
+interval. Contracts as $1/\sqrt{n}$ by construction, per-action, no new network --- a covariance
+per action is megabytes at this width. It also supplies the draws (0) needs. The head is
+dueling and distribution-valued, so ``the feature'' needs defining, the activation averaged over
+the head's own risk axis being the obvious choice.
+
+\emph{(b) Random-prior bootstrap heads.} Parameters are not the objection --- a final projection
+per member is negligible. The objections are that members sharing one feature layer have
+little left to disagree about, which is what the random prior exists to fix, and that they would
+be output layers in a network whose unfixed pathology is output-layer effective-learning-rate
+collapse. \S\ref{sec:related} shows this is the configuration deep IDS runs on Atari, down to the
+\texttt{stop\_gradient} on the distributional branch.
+
+\emph{(c) An intrinsic-value head.} A novelty signal --- RND's prediction error against a fixed
+random target, or a latent-prediction error of the BYOL-Explore kind, which this codebase is
+closer to having since it already carries a self-predictive branch on the plan of record ---
+carried through its own value head gives a per-\emph{state} quantity that contracts as a state
+becomes familiar. It is the only one that says anything about states the agent has not reached,
+and it is the only one whose signal is not in value units, so it is the one that needs a carrier
+(\S\ref{sec:c1}'s $\ddagger$). It belongs to \texttt{btr.py}'s exploration backlog rather than to
+this document, except through \S\ref{sec:coupling}.
+
+\emph{The shape to put any of them in} is the one \S\ref{sec:denoms} forced by separating what
+$\dbar$ was doing badly into two jobs: a carrier with the units, and a dimensionless modulation
+with the epistemics. Boltzmann--Gumbel's $\sigma/\sqrt{N_a}$ --- the reward's subgaussian
+parameter over an action's own visit count --- is that shape with a regret bound behind it, and
+Fox's $2\mu_A/\sigma_A^2$ --- the mean of the gap's posterior over its variance --- is that shape
+with a bias argument behind it (both \S\ref{sec:related}); they disagree about the exponent,
+which \S\ref{sec:owed} now carries.
+
+\subsection{Coupling under a contracting denominator}
+\label{sec:coupling}
+
+\S\ref{sec:c8-staging} refuses to couple \eqref{eq:rule} because the sharp limit has to stay
+reachable, which is a fact about staging and not about the denominator. With (I)'s denominator
+the same mechanism is the thing one would pay a head for, so it is worth stating as an experiment
+rather than leaving as a remark --- with the ceiling that \S\ref{sec:meas-couple} now puts on it.
+
+\emph{The arm.} $\tau(s) = \hat{s}(s)/g$ in \texttt{\_act} \emph{and} in the Munchausen target,
+$\hat{s}$ contracting, against the same rule decoupled. The two arms differ in exactly one term
+--- \eqref{eq:distortion} evaluated at $\hat{s}(s)/g$ --- so the comparison measures the intrinsic
+reward and nothing else, which is what an intrinsic-motivation scheme should get: a deliberate
+experiment with its own baseline.
+
+\emph{What it would buy.} An exploration bonus that is discounted, propagated \emph{and spent}:
+the value of a state that \emph{leads} to unresolved states rises, and falls again once they are
+resolved. Coupling any denominator buys the first two (\S\ref{sec:c8}); only a contracting one
+buys the third, and without it the same machinery yields a permanent pull toward states nothing
+can settle. It costs
+no intrinsic-reward head beyond whatever supplies $\hat{s}$, no second value stream, and it adds
+nothing to any individual action's value --- the denominator is a per-state scale, so the pitfall
+of optimism (\S\ref{sec:related}) does not apply to it.
+
+\emph{What it cannot buy, which is new and is measurable before the run.} The bonus reaches the
+objective only through \eqref{eq:distortion}, which is exponentially gated by the state's own
+gaps: hold every state at the ceiling and the great majority still receive under a tenth of
+$\tau_\ell\ln|\actions|$ (\S\ref{sec:meas-couple}). A state that is genuinely unvisited
+but where the critic is confidently wrong is paid nothing, which is precisely the state a novelty
+bonus exists to reach, and which a reward-level bonus reaches because it is ungated.
+\textbf{So the first thing to do is not the run.} It is to take whatever $\hat{s}$
+\S\ref{sec:fixdraw} produces, evaluate \eqref{eq:distortion} on it over replay states with
+\texttt{scripts/coupling\_cost.py}, and see whether the bonus lands on the states it is meant for
+or on the near-ties, as it does for \eqref{eq:rule}. That costs minutes and it decides whether
+the arm is worth a baseline.
+
+\emph{What it costs, and what has to be checked first.} The control path, which is the expensive
+part: a coupled arm needs its own baseline and forfeits the full-budget references
+(\S\ref{sec:project}). Three things then need re-examining, none of them fatal and none of them
+free. $l_0 = -1$ is \emph{not} one of them, which \S\ref{sec:couple-case} settles: coupled, a
+drawn transition is clipped with probability at most $|\actions|e^{-1/(\alpha\tau(s))}$ at each
+state, so the clip stays inert for any $\hat{s}/g$ sharp enough to be worth running and wakes
+only for a rule an order more diffuse than \eqref{eq:rule}.
+\textbf{The fixed point moves with $\lambda(s)$, and once
+$\lambda$ is a functional of $q$ the operator is not the one
+Remark~\ref{rem:coupled-ok} analyses} --- that remark licenses a fixed per-state schedule and no
+more, so a coupled arm is running an operator with no contraction argument behind it and should
+log $\srank$'s own trajectory to catch the feedback loop if it runs away. And $\hat{s}$ is then
+inside the loss, so a bug in it is a bug in the objective rather than a bug in the sampling,
+which is a different class of failure to debug. \S\ref{sec:fixdraw} comes first regardless: there is no
+contracting $\hat{s}$ on this codebase until it does.
+
+\subsection{Servo control, where it is well posed}
+\label{sec:servo}
+
+What retired the three servos stands exactly where it was aimed: at servoing the \emph{level}
+against $J$, which is not monotone and is worth less than a seed. Neither objection touches a
+servo on a monotone, cheaply measured quantity, and Proposition~\ref{prop:rho} is precisely that
+certificate for regret against the scale. So servo $g$ --- not the return --- against a
+behavioural target measurable at every step: an off-greedy rate defined on values rather than on
+the argmax, so that \S\ref{sec:c3} survives, or --- once the draw has been dealt with and its
+floor no longer swamps the measurement --- the realised $\rho/\gapbar$. One integrator, one
+constant, no head, and it converts the rule's last hand-set number into a target.
+
+The measured warning is new and it inverts the previous revision's assumption. Rates were
+supposed to be the portable anchor and value quantities the unportable ones. In fact the two best
+arms this project has run sit an order of magnitude apart in off-greedy rate
+(\S\ref{sec:meas-g}), so \emph{the target does not
+transfer between games} even though \eqref{eq:rule} does. A servo therefore sets the level within
+a game; what crosses games is the rule, not its set point.
+
+\subsection{Return normalisation}
+\label{sec:norm}
+
+True of \eqref{eq:rule}'s constants, false of everything around them. A running estimate
+$\snorm$ of the dispersion of returns in the buffer costs one scalar and one update; three
+things it buys.
+
+\emph{It is what the primed candidates are made of, and the table says how far that gets.}
+$\snorm$ is the only thing that repairs (C)'s \S\ref{sec:c1} failure, and (C) is the most
+precisely right candidate on \S\ref{sec:c2}: the mistake gets rarer at exactly the rate that
+keeps its cost constant. So (C$'$) is carried through \S\ref{sec:cases} rather than introduced
+here, and what the column shows is that the repair is real and partial --- \S\ref{sec:c1} is
+fixed, while \S\ref{sec:c5} and \S\ref{sec:c6} are not, a budget fixed in units of the game's
+return dispersion being still infeasible once the gaps at a state contract under it. A global
+normaliser divides out the value unit once per game; it cannot divide it out once per state,
+which is the difference between it and \eqref{eq:rule}.
+
+\emph{It makes the inherited absolute constants mean something.} \texttt{IQN\_HUBER\_LOSS\_K} $=
+1$ and $l_0 = -1$ are both thresholds inherited from reward clipping's $[-1,1]$. Not this
+document's problem, but the same normaliser is what fixes them, and the plan of record already
+schedules one for the categorical arm.
+
+\emph{And only an external scale can detect a collapse.} Every ratio in \eqref{eq:rule} is
+homogeneous of degree zero, which is exactly why it passes \S\ref{sec:c6} --- and exactly why it
+is blind there. $\gapbar/\srank$ cannot distinguish a fine-grained game from a value function
+that has died, because both look like small gaps against a matching spread. $\snorm$ is
+estimated from returns in the buffer rather than from the network, so $\gapbar/\snorm$ can.
+\eqref{eq:rule} declines to amplify the Enduro failure; an external unit is what it would take to
+push back on it, and the diagnostic is worth having even if nothing acts on it.
+
+\emph{And it is nearly the same object as \S\ref{sec:denoms}'s}, which makes both cheaper to
+justify: $\sret$ is a per-state PopArt scale obtained for free, and a global $\snorm$ is its
+average over states. Normalising globally and acting at a fixed $\tau$ in normalised units is
+candidate (A$'$), which is this document's rule at coarser resolution. The per-state refinement
+is measured to be worth about what the cross-game one is (\S\ref{sec:denoms}) --- so they are
+complements and not
+alternatives.
+
+\subsection{The assembled scheme}
+
+Information-directed sampling, whose deep form \S\ref{sec:related} states in full. Three
+properties earn it the place. It acts at the argmin over actions of a ratio $\hat\Delta^2/I$,
+a squared per-action regret estimate over an information gain (\S\ref{sec:related} states both;
+neither symbol is this document's $\rho$ or $\lambda$). It is scale-invariant by construction,
+since rescaling rewards by $c$ multiplies that ratio by $c^2$ uniformly and the argmin does not
+move; it prices a catastrophic action by the square of its regret and so passes \S\ref{sec:c2}
+with no floor; and it is the only
+candidate in this document that trades regret against information rather than assuming a
+functional form for the trade. Its two inputs are the two halves \S\ref{sec:c10} asks to be
+separated, and \eqref{eq:uasplit} is a cheaper way to get them than the one it uses. It is named
+as the destination rather than proposed: the components land one at a time, with \eqref{eq:rule}
+as the control.
+
+\section{Related work}
+\label{sec:related}
+
+Ten papers, read rather than searched. Three of them change a claim made above and are marked
+\textbf{[changes]}; the rest place the design.
+
+\paragraph{\textbf{[changes \S\ref{sec:denoms}, \S\ref{sec:rule}]} The rule's functional form is
+not new, and the exponent is now the open question.} Fox, \emph{Toward provably unbiased
+temporal-difference value estimation} (NeurIPS 2019 workshop), reported in Hu, Abbeel and Fox
+(\texttt{arXiv:2111.14204}): in a two-action problem where the gap $Q(s,a_0) - Q(s,a_1)$ has
+Gaussian uncertainty with mean $\mu_A$ and variance $\sigma_A^2$, the inverse temperature that
+eliminates the bias in an entropy-regularised value update is, in closed form,
+$\beta(s) = 2\mu_A/\sigma_A^2$. A per-state temperature set by a gap over the spread of that gap
+therefore has a derivation behind it and predates this document. Two differences survive, and
+both are now owed rather than settled:
+
+\begin{itemize}
+  \item \emph{Which $\sigma$.} Fox's is the epistemic variance of the gap \emph{estimate}, and
+  \S\ref{sec:denoms} measures $\srank$ to be essentially aleatoric. So the two rules are not
+  variants of each other; they divide by different quantities that happen to share a shape.
+  \item \emph{The exponent, which only matters once the first point is settled.} In the
+  sharpness units of \S\ref{sec:bg}, where \eqref{eq:rule}'s operating branch reads
+  $k = g\,\gapbar/\srank$ (\eqref{eq:rule-k}), Fox's rule is $2(\mu_A/\sigma_A)^2$ --- the
+  \emph{square} of the signal-to-noise ratio, where the rule is linear in it. Substituted with the
+  epistemic spread this codebase actually has, it fails to transfer by a wide margin where
+  $\srank$ transfers (\S\ref{sec:denoms}), because squaring a denominator that does not
+  transfer does not transfer twice as badly but four times. That is not a verdict on Fox's
+  exponent --- it is the same verdict on the same draw, arrived at through a third statistic.
+\end{itemize}
+
+The same note supplies what \S\ref{sec:c11} asks for and no statistic in \S\ref{sec:denoms}
+gives: by the central limit theorem $\sigma_A^2$ falls as $1/n$, so Fox's $\beta$ grows linearly
+in the evidence at a state. Hu et al.\ then abandon the closed form for exactly that asymptotic
+--- their CBSQL sets $\beta(s) = \kappa\, n(s)$ from a CTS pseudo-count --- and, worth noting for
+\S\ref{sec:decouple}, they put it in the \emph{backup} (a mellowmax target) and act
+$\epsilon$-greedy. The one published per-state temperature schedule is in the loss, not in the
+behaviour policy.
+
+\paragraph{A state-dependent Boltzmann temperature by root-find also exists, and it is degenerate
+exactly where \S\ref{sec:c9} says.} Asadi and Littman, \emph{An alternative softmax operator}
+(ICML 2017, \texttt{arXiv:1612.05628}). Their maximum-entropy mellowmax policy is
+$\sm(\beta \hat{Q}(s,\cdot))$ with $\beta$ the root of
+$\sum_a e^{\beta(\hat{Q}_a - \mmax_\omega \hat{Q})}(\hat{Q}_a - \mmax_\omega \hat{Q}) = 0$, solved per
+state by Brent's method. At a tied state every bracket vanishes and the equation reads $0 = 0$
+for every $\beta$ --- the degeneracy \S\ref{sec:c9} identified in the previous revision's
+root-find, in the published version of the same construction. Their motivation is orthogonal to
+this document's: $\beta(s)$ is chosen so the induced operator is a non-expansion and GVI has a
+unique fixed point, not so the constant transfers. They also show the fixed-$\beta$ Boltzmann
+operator has \emph{multiple} fixed points on a two-state MDP, which is a hazard
+Remark~\ref{rem:coupled-ok}'s contraction result does not cover --- and it is the second reason
+that remark cannot license a $\beta(s)$ read off $q$, the first being that it assumes one that is
+not.
+
+\paragraph{\textbf{[changes \S\ref{sec:c10}, \S\ref{sec:readmit}]} The epistemic/aleatoric split
+is purchasable for two draws, not for a head.} Clements et al., \emph{Estimating risk and
+uncertainty in deep RL} (\texttt{arXiv:1905.09638}). For a quantile network with outputs
+$y_i(\theta)$ they define $\sigma^2_{\mathrm{epi}} = \E_i \Var_\theta(y_i)$ and
+$\sigma^2_{\mathrm{ale}} = \Var_i(\E_\theta y_i)$, prove
+$\Var_{\theta,i}(y_i) = \sigma^2_{\mathrm{epi}} + \sigma^2_{\mathrm{ale}}$, and give the unbiased
+two-draw estimators of both that \S\ref{sec:bg} states as \eqref{eq:uasplit},
+whose own variance vanishes as the number of quantiles grows. Two draws is what the previous
+revision was already willing to pay for $\dbar$, and the acting quantile sample is what
+\texttt{\_act}
+already has. They also prove the obvious single-draw estimator --- $\Var_i[y_i(\hat\theta)]$,
+which is $\sret$ --- is biased \emph{upward} as an estimate of the aleatoric part, by the
+epistemic term. \S\ref{sec:denoms} now runs all of this. The estimator behaves --- the covariance term is
+positive at every state, and the aleatoric half agrees closely with the same spread taken on
+the noise-zeroed network, so the bias they warn about does not reach the figures here. It does
+not because of the zeroing and not because the epistemic term is small --- on the centred
+statistic it is not small (\S\ref{sec:denoms}) --- and the epistemic term it recovers is flat
+across a run and spans
+widely across games and behaviour policies. \eqref{eq:uasplit} is only as good as the
+draws, and it inherits Remark~\ref{rem:peraction} entire; their own draws come from two
+auxiliary networks under randomised MAP sampling, which is the cost they pay and we have not.
+The one part of the construction that is quantile-specific --- the pairing at a common quantile
+index --- is therefore also the part worth nothing here, which is convenient given that
+\S\ref{sec:bg} defines $\srank$ so that it survives a categorical head.
+
+\paragraph{\textbf{[changes \S\ref{sec:meas-g}]} Churn is a third exploration source of the same
+size as the one being calibrated.} Schaul, Barreto, Quan and Ostrovski, \emph{The phenomenon of
+policy churn} (\texttt{arXiv:2206.00730}). In DQN on Atari the greedy action changes in
+${\sim}10\%$ of states per \emph{single} gradient update, which over a run is a million changes
+per state; they argue this implicit exploration is why $\epsilon$ matters less than assumed. BTR's
+Table~5 measures $3.8\%$ churn on Phoenix with IQN, against the off-greedy rate
+\S\ref{sec:meas-g} anchors $g$ on. So the anchor is being matched to a quantity of the same
+magnitude as one nobody controls, which is a caveat on the anchor and not on the rule. One
+further reading cuts against \S\ref{sec:c3}: they test churn with the full Atari action set
+exposed, creating deliberate redundancy, and find the magnitude barely moves, with no structure
+relating swaps to known action equivalences. Duplication may therefore explain less of Zaxxon's
+small gap than \S\ref{sec:c3} assumes.
+
+\paragraph{A per-action rate from a reward scale over a count, with a regret bound --- in
+bandits.} Cesa-Bianchi, Gentile, Lugosi and Neu, \emph{Boltzmann exploration done right}
+(\texttt{arXiv:1705.10257}). The negative result is sharper than the abstract suggests and also
+narrower: in a two-armed \emph{stochastic bandit}, Boltzmann exploration with any learning-rate
+sequence growing faster than $2\log t$ has linear regret, and monotone schedules are suboptimal
+generally. Their remedy, $\beta_{t,i} = \sqrt{C^2/N_{t,i}}$ with $C$ the reward's subgaussian
+parameter, is per-\emph{arm}, and it is not a Boltzmann policy: they perturb each estimate by an
+independent Gumbel and take the argmax, which coincides with a softmax only when the scale is
+common across actions. So the carrier-times-modulation shape is right and the softmax is not the
+form it takes. Two details transfer: the bound survives underestimating $C$ (penalised
+exponentially in the true $\sigma^2$), and a heavy-tailed variant replaces $\sigma^2$ by a bound
+on the second moment, so the scale need not be known exactly. None of it is a discounted control
+result, which is what \S\ref{sec:owed} wanted to know.
+
+\paragraph{The quantile spread is a mixture, and using it naively is a known failure.} Mavrin
+et al., \emph{Distributional RL for efficient exploration} (\texttt{arXiv:1905.06125}). A QR
+distribution mixes parametric uncertainty, which vanishes with data, and intrinsic uncertainty,
+which does not; they construct a bandit where a bonus from the raw spread never selects the best
+arm, because the best arm has the lowest intrinsic variance. Their two patches are a decaying
+multiplier $c_t = c\sqrt{\log t/t}$ --- the rate at which parametric uncertainty decays in
+quantile-regression theory, and a global clock of exactly the kind Cesa-Bianchi et al.\ prove
+suboptimal --- and a left-truncated variance about the median, for asymmetry. \S\ref{sec:denoms}
+is their prediction measured: \S\ref{sec:denoms} finds $\sret$ flat across checkpoints, which
+is
+what ``the parametric part has already vanished and the intrinsic part remains'' looks like.
+
+\emph{Why their counterexample does not transfer, and what does.} Their bonus is per-action and
+\emph{added to the value}, so it biases which action is chosen toward the noisy one; Cho et al.,
+\emph{Pitfall of optimism} (\texttt{arXiv:2310.16546}), make the same point as their central
+claim and fix it by randomising the risk criterion instead. \eqref{eq:rule} adds nothing to any
+action's value: its denominator is a mean over actions, a per-state scale, and a scale cannot
+change the ordering. What survives of the objection is weaker and is \S\ref{sec:c10}'s version
+--- the policy diffuses where outcomes are noisy, rather than preferring the noisy action.
+
+\paragraph{The assembly, with the normaliser this document arrived at independently.} Nikolov,
+Kirschner, Berkenkamp and Krause (\texttt{arXiv:1812.07544}). Their deep IDS is, per step,
+$\hat\Delta(s,a) = \max_{a'}[\mu + \lambda\sigma](s,a') - [\mu - \lambda\sigma](s,a)$,
+$I(s,a) = \log(1 + \sigma^2(s,a)/\rho^2(s,a)) + \epsilon_2$, act at $\argmin_a \hat\Delta^2/I$,
+with $\sigma$ from $K$ bootstrap heads split after the convolutions and $\rho^2$ from a separate
+distributional head off the shared features, its loss not propagated into the trunk. Two things
+to take. Their $\rho^2(s,a)$ is $\Var(Z(s,a))$ \emph{divided by the mean over actions of
+$\Var(Z(s,\cdot))$} --- which is $\sret$, used as a per-state scale to make the ratio
+dimensionless, arrived at here from the units and there from the information ratio. And the
+architecture is exactly \S\ref{sec:readmit}(b): bootstrap heads on the trunk, distributional head
+behind a \texttt{stop\_gradient}.
+
+\paragraph{Persistence is buyable without touching the network at all.} Dabney, Ostrovski and
+Barreto, \emph{Temporally-extended $\epsilon$-greedy} (\texttt{arXiv:2006.01782}). Repeat the
+exploratory action for a duration $n \sim \zeta(\mu)$, heavy-tailed, $\mu = 2$, capped at $100$
+for Rainbow-scale agents; comparable to pseudo-counts, RND and bootstrap on hard-exploration
+Atari without their losses elsewhere. It is carried in \S\ref{sec:fixdraw} as the control that any persistence experiment here should
+be run against. Note also that they classify NoisyNets \emph{with}
+Thompson sampling and randomised priors as ``non-stationary, temporally persistent'' --- the
+property Remark~\ref{rem:peraction} finds this codebase's wiring does not have. The family is
+credited with persistence it is not getting here.
+
+\paragraph{And what the search did not find, restated.} No paper sets a Boltzmann temperature
+from a \emph{distributional} spread per state. Fox has the shape from the epistemic variance of
+the gap; Mavrin has the distributional spread as a bonus; Asadi and Littman have the per-state
+root-find from an operator; Nikolov has the mean-over-actions return variance as a normaliser
+inside an information ratio. \eqref{eq:rule} is the one combination none of them writes down,
+and after reading, the reason looks less like an oversight and more like the fact that everyone
+who examined the spread closely concluded it was the wrong half of a mixture. \S\ref{sec:denoms}
+agrees with them about which half $\srank$ is. What it adds is that on this codebase the other
+half is not available at any price short of \S\ref{sec:fixdraw}, and that the wrong half is the
+only one that transfers between two games.
+
+\section{Measurements}
+\label{sec:meas}
+
+Everything measured in this document is here, and nothing above is measured anywhere else. There
+are four sources. Per-state statistics read off four checkpoints with the noise zeroed
+(\texttt{scripts/spread\_probe.py}, \texttt{scripts/probe\_checkpoint.py},
+\texttt{results/spread\_*.json}, \texttt{results/probe\_*.json}, \texttt{results/rho\_*.json}):
+minutes on a checkpoint, reading the network rather than the return. Policies scored by rollout
+at fixed weights (\texttt{scripts/score\_policies.py}): hours, and noisy, as \S\ref{sec:meas-return}
+says. Post-processes of the per-state arrays the first of those writes
+(\texttt{scripts/coupling\_cost.py}, \texttt{results/coupling\_cost.json}): seconds, no
+checkpoint, and re-runnable against any rule stated as a $\tau(s)$. And four complete $200$M-frame
+training runs, which are the expensive ones and the reason \S\ref{sec:obj}'s criterion is set
+where it is.
+
+One caveat governs all of it and is not repeated below. \emph{The four checkpoints are four
+different runs} --- two games, two behaviour policies, two points in training --- so every
+cross-checkpoint statement here is between runs and not within one. Whether the ratio this
+document is built on is stable inside a single run has never been watched, and it is
+\S\ref{sec:staging}'s first stage precisely because it is free.
+
+
+\subsection{The setting's own movement, and two verifications}
+\label{sec:meas-mvi}
+
+\paragraph{What a constant in value units would have to survive.} Over a single run
+\texttt{train/q} moves $195\times$ and \texttt{train/action\_gap} moves $13\times$, and their
+ratio $\mathrm{gap}/q$ \emph{falls} $7\times$ rather than holding. Across games the top-two gap is
+$0.033$ on Zaxxon against $0.179$--$0.231$ on Phoenix. This is \S\ref{sec:project}'s second
+constraint measured, and it is why no rule in this document carries a constant in value units.
+
+\paragraph{Proposition~\ref{prop:amp}, numerically.} \texttt{scripts/check\_mvi\_gap.py} iterates
+M-VI and entropy-regularised VI to convergence on random finite MDPs. At
+$\alpha \in \{0.5, 0.9, 0.99\}$ the measured gap ratio is $2$, $10$ and $100$ to six decimals at
+every state-action pair, against Munchausen's published $3$, $19$ and $199$
+(Remark~\ref{rem:erratum}), and $\|\sm(q_\infty/\tau) - \pi_*^\lambda\|_\infty < 10^{-13}$. The
+same script confirms Remark~\ref{rem:coupled-ok}'s contraction with $\tau(s)$ drawn once and
+spanning a decade.
+
+\subsection{The observed value collapse}
+\label{sec:meas-collapse}
+
+The event \S\ref{sec:c6} is built on, and the only one of this document's three observed cases
+that is a single incident rather than a trend. On the $\texttt{ACT\_TEMPERATURE} = 0.01$ Phoenix
+arm, \texttt{train/q} fell from $3.24$ to $1.97$ between $5$M and $11$M env steps with the policy
+going near-uniform, and \texttt{eval/returns} stayed flat to $33$M frames --- some $20$M frames
+given back, which is most of what sharpening from $0.03$ had bought (\S\ref{sec:meas-return}).
+The softmax's self-correction only reopens once the gap falls to $O(\tau)$, so a sharper draw
+carries a deeper collapse: this is the mechanism \S\ref{sec:c6} abstracts and the reason
+\eqref{eq:rule} needs the floor branch at all.
+
+\subsection{Candidate denominators}
+\label{sec:denoms}
+
+Every case in \S\ref{sec:cases} asks for a scale that comes from the state, and \eqref{eq:rule}
+names one. This subsection is what was available to supply it and why that one was chosen. Four checkpoints, $2048$ states from each one's own rollout, per-state statistics
+with the noise zeroed and $\dbar$ over eight live draws; \texttt{scripts/spread\_probe.py} and
+\texttt{results/spread\_*.json}, minutes on a checkpoint, reading the network rather than the
+return.
+
+Every candidate is a mean over actions, so \S\ref{sec:c3} holds by construction. $\dbar$ is the
+previous revision's, the spread of $\tilde{q}$ across draws of the parameter noise. $\sret$ and
+$\srank$ are read off the return distribution the head already emits. $\tilde\sigma_{\mathrm{epi}}$
+and $\tilde\sigma_{\mathrm{ale}}$ are \eqref{eq:uasplit} over the same eight draws, on the raw
+distribution and on the centred advantage alike.
+
+\emph{One correction to make first.} The draws must share a quantile draw. Estimating $\dbar$
+with a fresh $u$ sample per pass charges quantile-sampling noise to the parameter draw and
+inflates it by some $75\%$; every figure below fixes the sample across draws, and $\dbar$ is
+correspondingly smaller than an earlier reading of it.
+
+\begin{center}
+\small
+\begin{tabular}{lcccc}
+  \toprule
+   & Phoenix $46$M & Phoenix $250$M & Phoenix $200$M & Zaxxon $204$M \\
+   & soft $0.03$ & soft $0.005$ & argmax & soft $0.03$ \\
+  \midrule
+  $\gapbar$              & $0.405$  & $0.721$  & $0.934$  & $0.160$ \\
+  top-two gap            & $0.104$  & $0.187$  & $0.204$  & $0.033$ \\
+  $\sret$                & $0.439$  & $0.433$  & $0.432$  & $0.206$ \\
+  $\srank$               & $0.0366$ & $0.0736$ & $0.0651$ & $0.0171$ \\
+  $\dbar$                & $0.0540$ & $0.0526$ & $0.0590$ & $0.0282$ \\
+  \midrule
+  $\tilde\sigma_{\mathrm{epi}}$      & $0.0743$ & $0.0661$ & $0.0729$ & $0.0345$ \\
+  $\tilde\sigma_{\mathrm{ale}}$      & $0.4366$ & $0.4324$ & $0.4327$ & $0.2064$ \\
+  $\tilde\sigma_{\mathrm{ale}}$, centred & $0.0363$ & $0.0730$ & $0.0648$ & $0.0169$ \\
+  $\tilde\sigma_{\mathrm{epi}}$, centred & $0.0250$ & $0.0349$ & $0.0339$ & $0.0150$ \\
+  \midrule
+  $\gapbar/\sret$        & $0.99$   & $1.77$   & $2.35$   & $0.83$ \\
+  $\gapbar/\srank$       & $11.78$  & $11.24$  & $16.54$  & $11.21$ \\
+  $\gapbar/\dbar$        & $7.78$   & $14.35$  & $16.76$  & $5.77$ \\
+  $\gapbar/\tilde\sigma_{\mathrm{epi}}$ & $5.48$ & $11.18$ & $13.18$ & $4.61$ \\
+  $2(\gapbar/\tilde\sigma_{\mathrm{epi}})^2$ & $69$ & $261$ & $387$ & $50$ \\
+  $\eta^2$               & $0.315$  & $0.542$  & $0.657$  & $0.164$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+Means over states; the ratios are means of the per-state ratio, which is what a per-state rule
+divides by, and not ratios of the columns above them. $\eta^2(s)$ is the share of the return's
+variance at $s$ that the choice of action explains, and is in the table as the one line that says
+how much of what the critic emits is about the decision at all.
+
+\paragraph{The prerequisite fails, on both readings it was given.} $\dbar$ does not move with the
+value scale: $0.0540$, $0.0526$, $0.0590$ across three Phoenix checkpoints over which $\gapbar$
+moves $2.3\times$. It does not fall as a run progresses. And across games it moves $1.9\times$
+where $\gapbar$ moves $4.5\times$, so $\gapbar/\dbar$ spans $5.8$ to $16.8$ over the four and a
+gain calibrated on one is wrong by up to $2.9\times$ on another. That is \S\ref{sec:project}'s
+second constraint failed by the denominator itself, which is the one place this design cannot
+absorb it.
+
+\paragraph{And the properly defined epistemic spread fails the same way, which closes the
+question.} $\dbar$ is a crude statistic --- the spread of the \emph{mean} across draws --- so
+its failure could have been the estimator rather than the quantity. \eqref{eq:uasplit} is the
+unbiased one, and it agrees: $\tilde\sigma_{\mathrm{epi}}$ reads $0.0743$, $0.0661$, $0.0729$ on
+the three Phoenix checkpoints, flat again, and $\gapbar/\tilde\sigma_{\mathrm{epi}}$ spans
+$4.6$--$13.2$ over the four, which is no better than $\dbar$'s and far worse than $\srank$'s
+$1.5$.
+Fox's form fares worse still, its denominator being squared: $2(\gapbar/\tilde\sigma_{\mathrm{epi}})^2$
+spans $50$ to $387$ (\S\ref{sec:related}). \textbf{No epistemic denominator available on this
+codebase transfers, and the estimator is not what is wrong with them.} The draw is
+(Remark~\ref{rem:peraction}).
+
+\paragraph{$\srank$ is measured to be aleatoric, which confirms \S\ref{sec:c10} rather than
+answering it.} Taking \eqref{eq:uasplit} on the centred advantage, the aleatoric half reads
+$0.0363$, $0.0730$, $0.0648$, $0.0169$ against $\srank$'s $0.0366$, $0.0736$, $0.0651$, $0.0171$
+--- equal to within $1\%$ on every checkpoint. The epistemic half of the ordering's spread is
+half to nine-tenths of that in magnitude and is the part that does not transfer. The same holds
+for $\sret$ against $\tilde\sigma_{\mathrm{ale}}$, where the epistemic term is $15$--$17\%$ of
+the aleatoric one and is genuinely small. Two consequences. \emph{Zeroing the noise is what buys
+the agreement}, not the epistemic term being small: the bias \S\ref{sec:related} warns of is the
+bias of a spread taken \emph{on a draw}, and every figure here is taken with the noise zeroed,
+which is why $\srank$ lands on the aleatoric half instead of above it --- on a live draw the
+centred statistic would sit a tenth to a third high. And the decomposition survives the centring,
+the covariance estimator being positive at every state on every checkpoint.
+
+\paragraph{And it is flat for a reason that is worse than drift.} \texttt{noisy\_sigma\_ratio}
+falls from ${\sim}0.6$ to $0.024$--$0.071$ over a run while \texttt{weights/global\_norm} goes
+$61 \to 162$; the product of a decaying $\snoise$ and a growing kernel is roughly constant.
+$\dbar$ is therefore not an uncertainty that happens to be flat, it is two unrelated drifts
+cancelling --- and the project's stated next intervention is on the second of them. A rule
+divided by $\dbar$ would have had its exploration schedule silently rewritten by a fix aimed at
+\texttt{adam\_step\_rel}.
+
+\paragraph{$\sret$ is a property of the game.} $0.439$, $0.433$, $0.432$ on Phoenix regardless of
+epoch or behaviour policy, against $0.206$ on Zaxxon. It is the return's own dispersion and it is
+the right \emph{unit} --- a per-state PopArt scale, obtained for free (\S\ref{sec:readmit}) ---
+but a temperature $\sret/g$ is then a per-game constant that calibrates itself, not a rule that
+responds to a state. Its per-state variation is real ($0.96$--$2.95$ in $\gapbar/\sret$ at
+$\text{p}5$--$\text{p}95$ on the $250$M Phoenix net) but \S\ref{sec:c10} says the variation is the wrong kind.
+
+\paragraph{$\srank$ is a property of how well the ordering is resolved, and it transfers.}
+$\gapbar/\srank$ reads $11.78$, $11.24$ and $11.21$ on three soft-trained checkpoints spanning
+two games, $4.5\times$ in $\gapbar$, $8$ actions against $18$, and $46$M frames against $250$M.
+The whole per-state distribution coincides, not only the mean: $\text{p}5$--$\text{p}95$ is
+$4.5$--$18.8$ on Phoenix against $4.7$--$20.3$ on Zaxxon. It moves to $16.54$ on the
+argmax-trained net, which is the arm that scores $1.30\times$ the soft one and whose ordering is
+by that much better resolved --- so the quantity is not constant, it tracks the one thing it is
+supposed to track and is invariant to the things it should be invariant to. Two games is two
+games, and this is the claim most worth breaking on a third.
+
+\paragraph{Both distributional denominators carry information the gap does not.} On the two
+Phoenix nets the correlation between $\ln\gapbar$ and $\ln\srank$ over states is $+0.20$ and
+$+0.06$, so the ratio is not a restatement of the numerator; on Zaxxon it is $+0.63$ and half of
+it is. $\dbar$ is comparably independent ($+0.06$, $+0.05$, $+0.26$) and correlates
+$0.47$--$0.67$ with the distributional ratio, so the two denominators agree about half the time and disagree
+enough that the choice between them is not cosmetic.
+
+\paragraph{Nothing here anneals.} This is \S\ref{sec:c11}, and it is the finding that decides
+what the rest of the document is about. $\gapbar/\srank$ is flat from $46$M to $250$M, $\dbar$ is
+flat in absolute terms, $\sret$ is flat in absolute terms. A rule built from any of them holds a
+fixed \emph{relative} sharpness for an entire run. That is a strict improvement on holding a
+fixed absolute one and it is not the same thing as exploring less as you learn more.
+
+
+\subsection{The distortion family}
+\label{sec:meas-family}
+
+\S\ref{sec:bg} demands translation equivariance and positive homogeneity of every member of the
+family $\srankb$ is taken over. This is those demands checked, and what the choice costs once
+they are met. \texttt{scripts/distortion\_family.py}: seconds, no checkpoint and no rollout, every
+figure on constructed distributions whose answer is known in closed form --- which is the point,
+since an inadmissible reading is inadmissible for every network and there is nothing to learn
+from a checkpoint about it.
+
+\paragraph{Equivariance, on a pair whose answer is zero.} Two actions whose return distributions
+are exact translates: the ordering is resolved at every risk level, so $\srank = 0$ by
+\S\ref{sec:bg}'s zero set. Read through a categorical head:
+
+\begin{center}
+\small
+\begin{tabular}{lcc}
+  \toprule
+  reading & $\srankb$ & \\
+  \midrule
+  atom probabilities $p_i$          & $0.0246$ & inadmissible \\
+  tail means, threshold fixed on the support & $0.0563$ & inadmissible \\
+  tail means, each action's own median & $0.0000$ & \\
+  quantiles $F^{-1}(u)$             & $0.0000$ & \\
+  expectiles $e_\beta$              & $0.0000$ & \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{The atom probabilities fail worst, and in the one direction this design cannot absorb.}
+They are not a reading of the return at all --- a probability is not on the return axis --- and
+on a fixed support a translate is a shift along the atom \emph{index}, so two well-separated
+actions disagree maximally bin by bin. The reading therefore \emph{grows} the better the ordering
+is resolved: $0$, $0.0087$, $0.0161$, $0.0246$, $0.0271$ as the separation goes $0$ to $8$. A
+rule dividing by it would spread the policy widest exactly where one action is clearly best,
+which inverts \S\ref{sec:rule}'s failure paragraph.
+
+\paragraph{Scale, which is all that survives admissibility.} Two admissible families disagree
+about $\srank$ by a factor, and whether that factor is constant decides whether $g$ absorbs it.
+Uniform over levels against the two-point pair, by the shape of the centred advantage:
+
+\begin{center}
+\small
+\begin{tabular}{lccc}
+  \toprule
+  advantage shape & over levels & two-point & ratio \\
+  \midrule
+  linear in $u$            & $0.2887$ & $0.2500$ & $1.15\times$ \\
+  step at the median       & $1.0000$ & $1.0000$ & $1.00\times$ \\
+  S-curve, heavier tails   & $0.8175$ & $0.7698$ & $1.06\times$ \\
+  bottom $25\%$ only       & $0.4330$ & $0.2500$ & $1.73\times$ \\
+  catastrophic bottom $5\%$& $0.2179$ & $0.0500$ & $\bm{4.36\times}$ \\
+  jackpot top $5\%$        & $0.2179$ & $0.0500$ & $\bm{4.36\times}$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Two regimes, and only one is a problem.} Where the ordering disagreement is spread
+broadly the families differ by $1.00$--$1.15\times$, a constant, absorbed entirely into $g$:
+$\gapbar/\srank$ would move from $11.2$ to ${\sim}12.9$ and nothing else would. Where it is
+concentrated in a tail they differ by $4.36\times$, and the factor is \emph{state-dependent}, so
+it reshapes $\tau(s)$ rather than rescaling it and no choice of $g$ repairs it. Which regime a
+game is in is a property of the game: a state where one action is fine except that it
+occasionally ends the episode is the tail-concentrated case, which is \S\ref{sec:c2}'s. So the
+coarser family is safe exactly where \S\ref{sec:c2} is not binding, and \S\ref{sec:owed} carries
+the measurement that would say which.
+
+Quantiles against expectiles on one risky-against-safe pair at equal means --- real disagreement,
+both admissible --- reads $0.9522$ and $0.6098$, a factor of $0.64$. That is the correction of
+\S\ref{sec:bg} priced: the family the head has been fitting all along differs from the one this
+document described by a constant, and $g \approx 4$ was calibrated through it either way.
+
+\paragraph{Quantisation, under a fixed support.} $\srank$ is small, so a reading that resolves no
+finer than one atom spacing could be reporting nothing. Exact translates again, shifted by
+fractions of the spacing, with C51's two-point projection applied as the head would:
+
+\begin{center}
+\small
+\begin{tabular}{lccc}
+  \toprule
+  shift (atom spacings) & quantiles & expectiles & own median \\
+  \midrule
+  $0.10$ & $0.0000$ & $0.0006$ & $0.0005$ \\
+  $0.25$ & $0.0000$ & $0.0012$ & $0.0014$ \\
+  $0.50$ & $0.0000$ & $0.0021$ & $0.0027$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+Against a $\srank$ measured at $0.0171$--$0.0736$ (\S\ref{sec:denoms}) the spurious floor is
+$8$--$120\times$ below the signal, so \textbf{quantisation is not a threat to the quantity}. But
+the zeros in the first column are not a pass: the quantile reading is \emph{blind} below one
+spacing rather than quiet, and on a game whose $\srank$ is small against the atom spacing it
+would collapse to zero and turn \eqref{eq:rule} into argmax without saying so.
+\eqref{eq:expectile} is smooth in $p$ and does not.
+
+\paragraph{The knee is never reached, which is what picks the family.}
+\texttt{IQN\_HUBER\_LOSS\_K} is $1$ against a raw $|td|$ that spans $0.02$--$0.45$ over a run, so
+the quantile Huber sits in its quadratic branch throughout and \S\ref{sec:family}'s correction
+holds for the whole of a budget rather than for part of it. That the estimand does not drift
+between branches is the one thing here that a run could have spoiled and does not.
+
+\paragraph{The closed form.} \eqref{eq:expectile} against a bisection on the same distributions,
+maximum absolute error $4\times10^{-16}$ --- so the expectile family costs a
+\texttt{searchsorted} and a division, not a root-find, which is what makes it affordable at the
+same price as the quantile lookup it replaces.
+
+
+\subsection{Action gaps}
+\label{sec:meas-gap}
+
+\paragraph{Action gaps.} \texttt{results/probe\_*.json} puts Phoenix's top-two gap inside BTR's
+own $0.180$--$0.282$ band, so there is no action-gap deficit to explain. \S\ref{sec:denoms}'s
+table supersedes the rest of this reading and sharpens it: the gap is a property of the game by
+$5.7\times$ and of the behaviour policy by $1.3\times$, which is \S\ref{sec:project}'s second
+constraint measured, and it is the movement that \eqref{eq:rule}'s denominator has to absorb.
+
+
+\subsection{Exploration regret}
+\label{sec:meas-rho}
+
+\paragraph{Exploration regret.} \texttt{results/rho\_phoenix\_*.json}, $2048$ replay states per
+checkpoint, at the per-decision horizon $H = 333$: the parameter draw costs $1.0$--$1.5\%$ of
+$Q^\star$, the softmax at $\tau = 0.03$ costs $4.9$--$6.0\%$, and BTR's own $\epsilon = 0.01$
+costs $11.5$--$17.5\%$ \emph{while winning}. Four checkpoints agree to some $30\%$, so the
+quantity prices the policy rather than the weights. Below $\tau \approx 0.003$ the series flattens
+onto the draw's floor --- which is \S\ref{sec:meas-g}'s point, and it is also why no controller can
+usefully servo $\rho$ on this codebase without a second value head to price the draw against.
+
+
+\subsection{Return: full runs, and $J(\tau)$ at fixed weights}
+\label{sec:meas-return}
+
+\paragraph{Four full runs.} $200$M-frame Phoenix arms differing in acting sharpness, one seed
+each, scored against BTR's \texttt{results.csv} Phoenix row, geometric mean:
+
+\begin{center}
+\begin{tabular}{lcccc}
+  \toprule
+  arm & $1$--$50$M & $50$--$200$M & $100$--$200$M & $150$--$200$M \\
+  \midrule
+  argmax + parameter draw & $\bm{0.693}$ & $\bm{1.072}$ & $\bm{1.057}$ & $\bm{1.128}$ \\
+  softmax, $\tau = 0.005$ & $0.304$ & $0.901$ & $0.945$ & $0.968$ \\
+  softmax, $\tau = 0.01$  & $0.213$ & $0.718$ & $0.818$ & $0.935$ \\
+  softmax, $\tau = 0.03$  & $0.630$ & $0.787$ & $0.825$ & $0.910$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+Three readings, and they set every priority above. \emph{Each soft arm is the argmax curve
+delayed}, by $22.5$M, $42.5$M and $40$M frames respectively, overlaying to within $1$--$6\%$ after
+the shift --- so sharpness buys and spends time rather than choosing a point on a trade-off curve.
+\emph{The level is worth less than a seed}: $19\%$ spread over $150$--$200$M against $3.2\times$
+over $1$--$50$M, with one seed per arm, which is why no controller on the level appears in this
+document. \emph{All of the damage is early}, which is where \S\ref{sec:c5} and \S\ref{sec:c6}
+live and where nothing else on the project's plan is aimed.
+
+\paragraph{$J(\tau)$ at fixed weights.} $J(\tau)$ is the return of the policy at acting scale
+$\tau$ played on weights that are not being updated --- what a level criterion would be servoing,
+and the only thing here measured by rollout. \texttt{scripts/score\_policies.py}, two Phoenix
+checkpoints, $32$ episodes per cell, returns in thousands with the standard error of the mean:
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{lccccc}
+  \toprule
+  weights & argmax & $0.003$ & $0.01$ & $0.03$ & $0.1$ \\
+  \midrule
+  soft-trained, $\tau = 0.03$ & $\bm{368.8}\pm27.8$ & $340.5\pm27.3$ & $310.0\pm34.0$
+                              & $300.7\pm31.7$ & $164.5\pm16.4$ \\
+  argmax-trained              & $200.0\pm16.6$ & $169.8\pm17.1$ & $\bm{227.2}\pm23.0$
+                              & $169.9\pm19.7$ & $56.6\pm5.6$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+The signal is $2$--$5\%$ per octave and the measurement noise is $8$--$12\%$, which is the reason
+no criterion in this document scores a policy by rollout. On the soft-trained weights $J$ falls
+monotonically and argmax wins, which is why \eqref{eq:rule} is built to contain argmax rather than
+to improve on it. The cells do not carry a normal approximation --- the soft-trained $0.01$ cell
+runs from $7{,}240$ to $583{,}990$ --- and the shape is suggestive at best.
+
+
+\subsection{The off-greedy rate and the gain $g$}
+\label{sec:meas-g}
+
+The rule's two constants are dimensionless and each has an anchor rather than a range to
+search. This subsection is the first of them.
+
+\paragraph{$g$, and what it is measured to buy.} One gain, four checkpoints, off-greedy
+probability under \eqref{eq:rule} against the fixed temperature it replaces:
+
+\begin{center}
+\small
+\begin{tabular}{lccccc}
+  \toprule
+  & Phoenix $46$M & Phoenix $250$M & Phoenix $200$M & Zaxxon $204$M & spread \\
+  \midrule
+  fixed $\tau = 0.03$      & $0.169$ & $0.095$ & $0.090$ & $0.476$ & $5.3\times$ \\
+  \eqref{eq:rule}, $g = 4$ & $0.049$ & $0.053$ & $0.044$ & $0.057$ & $1.3\times$ \\
+  \eqref{eq:rule}, $g = 6$ & $0.032$ & $0.037$ & $0.029$ & $0.037$ & $1.3\times$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\emph{This is the whole claim of the document, in one table.} A constant in value units delivers
+a $5.3\times$ range of behaviour across two games, two behaviour policies and two points in
+training; the same rule at one dimensionless gain delivers a $1.3\times$ range over the same set.
+The relative regret $\rho/\gapbar$ agrees to the same tolerance, $0.0016$--$0.0032$ at $g = 4$.
+
+\textbf{$g \approx 4$}, then, from the one external anchor that survives: it is where the
+undirected layer contributes about what the parameter draw already contributes on its own
+($3.8$--$4.5\%$ off-greedy). $g \approx 3$ doubles the total spend, which is a defensible first
+choice and a decision to log rather than a search. One caveat on the anchor, from
+\S\ref{sec:related}: BTR's Table~5 measures $3.8\%$ policy churn on Phoenix, so the rate being
+matched is the same size as the involuntary change in the greedy action between two updates, and
+some of what the anchor prices may not be attributable to the behaviour policy at all. Note what this anchor is \emph{not} --- a
+claim that $4.5\%$ is the right rate. The two best arms this project has run sit at $4\%$
+(Phoenix argmax) and $48\%$ (Zaxxon at $\tau = 0.03$), so the rate that wins is not portable even
+where the rule that produces it is. \eqref{eq:rule} makes the two games commensurable; it does
+not say where on the axis to stand, and \S\ref{sec:readmit} is the only thing here that could.
+
+\emph{Why not calibrate against the best soft arm's measured $\rho$.} Because $83$--$90\%$ of that
+number is the parameter draw. On \texttt{phoenix\_2026-09-20\_02-21-56}'s final checkpoint the
+draw alone reads $\rho = 7.35\times10^{-4}$ and the $\tau = 0.005$ policy reads
+$8.9\times10^{-4}$, so the softmax's own contribution is $1.6\times10^{-4}$ --- a sixth of what a
+naive match would target. The previous revision's staging instruction matched the two directly
+and would have overspent by that factor. Net the floor out, always.
+
+
+\subsection{Sharpness and the floor $k_0$}
+\label{sec:meas-k}
+
+The floor is stated in the sharpness of \eqref{eq:rule-k}, so that $k_0$ is directly comparable
+with the arms that have run and with the fixed-weight cells of \S\ref{sec:meas-return}. That
+comparison is what moved it by an order of magnitude.
+
+\paragraph{The previous anchor was read off a model, and the model does not hold.} $k_0 = 4.4$
+came from a state with one best action and the rest at a common gap. Real states are not that:
+the top-two gap is $0.187$ against $\gapbar = 0.721$ on Phoenix, so a near-tie and not the mean
+gap sets the off-greedy rate, and the tail of clearly bad actions inflates $\gapbar$ without
+contributing any probability. Scored on real states instead of on the model, $k = 4.4$ puts some
+$40\%$ of decisions off the greedy action --- more diffuse than $\tau = 0.1$, the fixed-weight
+cell that scored $164$k against argmax's $369$k. The arms that actually ran sit at $k = 24$
+($\tau = 0.03$) to $k = 144$ ($\tau = 0.005$) on Phoenix. \textbf{The working band is $k = 24$ to
+$300$, and the previous revision's floor was an order of magnitude below the bottom of it}: it
+would not have guarded the rule, it would have been the rule.
+
+The same scoring validates the method, which is worth one line: at $\tau = 0.03$ it gives an
+off-greedy rate of $0.095$ against the $0.102$--$0.104$ measured directly on the acting stream.
+
+\paragraph{$k_0$, as a guard and not an operating point.} The floor binds where
+$\gapbar/\srank < k_0/g$, and that ratio's $\text{p}5$ is $4.5$ on Phoenix and $4.7$ on Zaxxon.
+So $k_0 \approx 20$ --- the sharpness of the most diffuse arm that has ever survived a full
+budget --- rests a few per cent of states on the floor at $g = 4$ and fewer at $g = 6$, which is
+what a guard should do. Log the resting fraction; if it climbs, $\srank$ is failing and
+\S\ref{sec:rule}'s failure paragraph is being exercised.
+
+\emph{Measured, the floor behaves. The ceiling behaves at one value of a constant and not at
+another, which is the finding.} At $g = 4$ and the $\tau_\ell = 0.03$ in force, the floor takes
+$3.2$--$6.0\%$ of states across the four checkpoints and the ceiling $\tau(s) \le \tau_\ell$ takes
+$0.1\%$, $3.8\%$, $3.7\%$ and $0.4\%$: both are guards doing their job. Lower $\tau_\ell$ to the
+$0.02$ that one run used and the ceiling's share becomes $1.3\%$, $26.7\%$, $17.4\%$ and $0.8\%$,
+so on the two later Phoenix checkpoints it stops being a guard and becomes the operating branch
+for a sixth to a quarter of decisions --- over which \eqref{eq:rule} is the fixed temperature it
+exists to replace.
+
+\textbf{A $1.5\times$ move in a loss constant changes the rule's resting fraction by $7\times$},
+and that is a property of the decoupled design rather than of either value: the ceiling is the one
+place the behaviour policy touches the loss (\S\ref{sec:bg}), so the rule inherits whatever is
+done to $\tau_\ell$ for reasons of its own. \S\ref{sec:decouple-ledger} carries it as decoupling's
+cost and \S\ref{sec:couple-case} as the reason coupling deletes the branch outright. $g = 6$
+holds the ceiling under $5\%$ at both values --- $0.2\%$, $4.3\%$, $4.1\%$, $0.6\%$ at $0.02$ ---
+which is one more reason to prefer the higher gain and is the only place in this document where
+the two gains are separated by something other than taste.
+
+\subsection{The distortion a coupled $\tau$ induces}
+\label{sec:meas-couple}
+
+\S\ref{sec:c8} weighs putting $\tau(s)$ into the loss, and \eqref{eq:distortion} is the whole of
+what that changes: a per-step intrinsic reward $D(s)$, in the units of $\tilde{q}$.
+\texttt{scripts/coupling\_cost.py} evaluates it on the same four checkpoints' per-state arrays
+and writes \texttt{results/coupling\_cost.json}; it is a post-process on
+\texttt{spread\_probe.py}'s output, so it needs no checkpoint and re-runs in a second. Four
+rows per checkpoint: \eqref{eq:rule} at $g = 4$; the same states held at the fixed
+$\tau_\ell = 0.03$, which is both the ceiling and what every arm in this section actually ran at,
+so the two coincide and only one row is needed; and candidate (D), $\tau = \gapbar/k_0$ at the
+$k_0 = 4.4$ the previous revision proposed, which is the rule \eqref{eq:rule} was ranked
+\emph{below} on this question.
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{llcccccccc}
+  \toprule
+  & & & & & \multicolumn{2}{c}{$D/\gapbar$} & \multicolumn{3}{c}{lift $\E_D[x]/\E[x]$} \\
+  \cmidrule(lr){6-7}\cmidrule(lr){8-10}
+  & & $k$ & $D$ & $D/Q^\star$ & mean & p95 & top-two & $\srank$ & $\gapbar$ \\
+  \midrule
+  Phoenix $46$M  & \eqref{eq:rule}, $g=4$ & $47$  & $5.6{\cdot}10^{-4}$ & $3.1{\cdot}10^{-5}$ & $0.19\%$ & $1.3\%$  & $\bm{0.11}$ & $1.20$ & $0.86$ \\
+                 & $\tau = \tau_\ell$     & $13$  & $6.4{\cdot}10^{-3}$ & ---                 & $2.4\%$  & $10.0\%$ & $0.25$ & $0.92$ & $0.74$ \\
+                 & (D), $k_0 = 4.4$       & $4.4$ & $4.0{\cdot}10^{-2}$ & $2.2{\cdot}10^{-3}$ & $\bm{11.0\%}$ & $20.0\%$ & $0.82$ & $1.06$ & $\bm{1.07}$ \\
+  \midrule
+  Phoenix $250$M & \eqref{eq:rule}, $g=4$ & $46$  & $9.5{\cdot}10^{-4}$ & $4.4{\cdot}10^{-5}$ & $0.16\%$ & $1.0\%$  & $\bm{0.09}$ & $1.11$ & $0.89$ \\
+                 & $\tau = \tau_\ell$     & $24$  & $3.5{\cdot}10^{-3}$ & ---                 & $0.58\%$ & $2.8\%$  & $0.15$ & $0.86$ & $0.88$ \\
+                 & (D), $k_0 = 4.4$       & $4.4$ & $7.7{\cdot}10^{-2}$ & $3.3{\cdot}10^{-3}$ & $\bm{11.1\%}$ & $20.5\%$ & $0.70$ & $0.97$ & $\bm{1.01}$ \\
+  \midrule
+  Phoenix argmax & \eqref{eq:rule}, $g=4$ & $67$  & $7.2{\cdot}10^{-4}$ & $3.4{\cdot}10^{-5}$ & $0.11\%$ & $0.69\%$ & $\bm{0.09}$ & $1.15$ & $0.80$ \\
+                 & $\tau = \tau_\ell$     & $31$  & $3.3{\cdot}10^{-3}$ & ---                 & $0.54\%$ & $2.5\%$  & $0.14$ & $0.85$ & $0.78$ \\
+                 & (D), $k_0 = 4.4$       & $4.4$ & $1.1{\cdot}10^{-1}$ & $4.7{\cdot}10^{-3}$ & $\bm{12.4\%}$ & $21.1\%$ & $0.82$ & $0.93$ & $\bm{1.07}$ \\
+  \midrule
+  Zaxxon $204$M  & \eqref{eq:rule}, $g=4$ & $45$  & $3.3{\cdot}10^{-4}$ & $3.0{\cdot}10^{-5}$ & $0.23\%$ & $1.4\%$  & $\bm{0.33}$ & $3.15$ & $1.50$ \\
+                 & $\tau = \tau_\ell$     & $5.3$ & $2.2{\cdot}10^{-2}$ & ---                 & $22.1\%$ & $72.5\%$ & $0.60$ & $0.83$ & $0.78$ \\
+                 & (D), $k_0 = 4.4$       & $4.4$ & $2.6{\cdot}10^{-2}$ & $2.3{\cdot}10^{-3}$ & $\bm{16.3\%}$ & $24.8\%$ & $1.01$ & $1.61$ & $\bm{1.34}$ \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{The shape of $D$, which is what \S\ref{sec:bg} reads it by.} Same states, same script,
+under \eqref{eq:rule} at $g = 4$. The identity $D = \tau\h(\pi_\tau) - \rho(\pi_\tau)$ holds to
+$10^{-14}$ on all four, and $\rho/\tau\h$ averages $0.57$--$0.83$, so the free bound
+$\rho \le \tau\h \le \tau\ln|\actions|$ is real but loose: against $\tau\ln|\actions|$ the realised
+regret is $1.6\times10^{-4}$ to $1.3\times10^{-3}$ at the median state and $0.16$--$0.19$ at the
+$99$th percentile. $D/\tau$ has a median of $4.3\times10^{-5}$ to $4.8\times10^{-4}$ and a mean
+$132$ to $1137\times$ larger, which is the tail this subsection's weighted means are reading.
+
+\paragraph{How many actions are in contention, and what the top-two shortcut costs.} The
+contention count $m = e^{D/\tau}$ of \S\ref{sec:bg} has a median of $1.0000$--$1.0005$ --- the
+typical state has one action in play and earns nothing --- but a $D$-weighted mean of
+$1.49$--$1.56$, and $46$--$53\%$ of $\sum D$ sits on states with $m > 1.5$. \textbf{So wherever
+the bonus is actually paid, the runner-up is not alone}, and the top-two form
+$D \approx \tau(1 + e^{-k_2})$ is being used exactly where it is weakest. Scored properly it
+costs: a median relative error of $0.00$--$1.48\%$, which is the figure a careless reading would
+quote, against a \textbf{$D$-weighted error of $3.3$, $4.3$, $3.3$ and $13.0\%$} and a $99$th
+percentile of $44$--$51\%$. The median is a statistic of the resolved states, where both forms
+agree at nothing. The larger action set is the worse case, as the mechanism predicts. For
+reference the near-tie sharpness $k_2 = \gap_2/\tau$ reads $0.66$--$0.84$, $7.7$--$10.2$ and
+$24$--$37$ at the fifth, fiftieth and ninety-fifth percentiles.
+
+\paragraph{What duplicating the action set would add.} $D = \tau\ln m$ and $m$ counts actions, so
+a duplication sends $D \mapsto D + \tau\ln(\text{copies})$ exactly --- confirmed here to
+$4\times10^{-16}$ relative, at two and three copies, on both games. The size is the point:
+\textbf{one duplication adds $8.4\times$ the entire mean $D$ on Zaxxon and $11.1\times$ it on
+Phoenix.} The added term is $\tau\ln 2$, and on the operating branch $\tau = \srank/g$, so it
+correlates with $\srank$ at $0.78$--$0.92$ across these states --- a bonus proportional to the
+denominator, arriving from the action set's spelling rather than from any near-tie.
+\S\ref{sec:c8} is what that does to the character of a coupled rule, and \S\ref{sec:c3} is the
+case the behaviour rule passes and the coupled objective does not.
+
+\paragraph{Two constants this subsection is read against.} \eqref{eq:couplegain}'s sufficient
+gain, evaluated at $\gamma = 0.997$ and $\alpha = 0.9$, is $g \gtrsim 69L$ on Phoenix and
+$96L$ on Zaxxon, with $L \le 2$; against the $g \approx 4$ of \S\ref{sec:meas-g} the cheap
+contraction argument misses by a factor of $17$ to $48$, and \S\ref{sec:couple-fixedpoint} is
+what follows. And \texttt{IQN\_ACT\_SAMPLES} is $32$ against \texttt{IQN\_TRAIN\_SAMPLES}'s $8$,
+so a coupled $\hat\tau$ read in the loss carries about twice the relative sampling error of the
+acting one, $27\%$ against $13\%$.
+
+\paragraph{Which branch pays it, what one ratio decides it, and how hard it pulls.}
+\eqref{eq:rule} is a $\min$ of three, and ``$\tau$ proportional to $\srank$'' describes only the
+first, so the share of $\sum D$ each branch carries is what says whether the description covers
+the measurement. It does: the $\srank/g$ branch carries $87\%$, $89\%$, $84\%$ and $67\%$, the
+floor $13\%$, $7\%$, $7\%$ and $24\%$, the ceiling $0\%$, $4\%$, $9\%$ and $9\%$. On that branch
+$D \approx (\srank/g)\exp(-g\,\gap_2/\srank)$, so the controlling quantity is the ratio
+$\gap_2/\srank$ and not either part of it --- and the lifts agree, $0.09$, $0.09$, $0.08$ and
+$0.11$ for the ratio against $0.09$--$0.33$ for $\gap_2$ and $1.11$--$3.15$ for $\srank$.
+$\sret$, the return width the risk-seeking charge was really about, lifts $1.13$, $1.07$, $1.08$
+and $1.53$: mild on Phoenix, real on Zaxxon.
+
+\emph{As a standing bias rather than a per-step term}, at the per-decision horizon of
+\S\ref{sec:meas-rho}, $H\,D/Q^\star$ is $1.05\%$, $1.36\%$, $1.04\%$ and $0.95\%$ --- the same
+bracket as the parameter draw's own $1.0$--$1.5\%$ exploration regret. The per-step comparison
+below and this one answer different questions and both belong in \S\ref{sec:c8}.
+
+\paragraph{Magnitude.} \textbf{Under \eqref{eq:rule} the induced intrinsic reward is $0.11$ to
+$0.23\%$ of the mean action gap and $3$--$4\times10^{-5}$ of $Q^\star$.} Against that,
+the cost of \emph{not} coupling --- the Munchausen bonus evaluated at an action the loss did not
+anticipate, which \S\ref{sec:decouple-ledger} accepts --- reads $-0.043$ against $-0.007$ across a
+twofold range of behaviour entropy on Zaxxon, or about $0.46\%$ of that run's
+$\texttt{train/q} \approx 7.8$. The two are per-step additive terms in the same units, so the
+comparison is direct and it goes the wrong way for \S\ref{sec:c8}'s original argument. Zaxxon
+carries both: the lost cancellation is $0.036$ in value units and $D$ under the rule is
+$3.3\times10^{-4}$, so coupling distorts the objective by \emph{one part in $109$} of what
+decoupling costs --- $0.0042\%$ of the critic's own scale against $0.46\%$. Both figures are at
+the $\tau_\ell$ in force, so neither needs rescaling to sit beside the other. What argues against coupling is
+\S\ref{sec:couple-fixedpoint} and \S\ref{sec:c8-staging}, neither of which depends on a
+magnitude. The intrinsic reward is not the reason and, at this size, is an argument the other
+way.
+
+\paragraph{The magnitude is set by sharpness, so the ranking of the candidates inverts.} Read
+down any block: $D/\gapbar$ rises $4$--$13\times$ on Phoenix and $98\times$ on Zaxxon as $k$
+falls from the rule's $45$--$67$ to the fixed temperature's $5.3$--$31$. $D$ is linear in $\tau$
+and exponential in $-\gap/\tau$ (\S\ref{sec:bg}), and the exponential is what moves.
+\eqref{eq:rule} is the sharpest rule in the family, so it is the one whose coupled bonus is
+negligible; candidate (D) at $k_0 = 4.4$, the diffuse end of the same family, averages
+$11$--$16\%$ of the mean gap with a $\text{p}95$ of $20$--$25\%$, and the fixed $\tau = \tau_\ell$
+on Zaxxon reaches $72\%$ at $\text{p}95$. The diffuse rules are where the objection has force, and
+every one of them is a rule this document has already retired for other reasons.
+
+\paragraph{Carrier: the bonus is paid on the near-tie, not on the denominator.} The last three
+columns weight each per-state quantity by the $D$ it carries and divide by its plain mean ---
+$\E_D[x]/\E[x]$, a lift of $1$ meaning no concentration. That is a weighted mean rather than a
+correlation of $\ln D$ deliberately, and the reason is sharper than ``$D$ is small''.
+$D = \tau\ln(1 + e^{-k_2} + \cdots)$ is a $\ln(1+x)$ whose $x$ falls below float64's resolution as
+soon as $k_2 > 36.7$, so a direct evaluation returns \emph{exactly} zero --- on $4.4\%$, $2.6\%$,
+$5.8\%$ and $0.3\%$ of these states --- where the true value is of order $10^{-51}\tau$. $\ln D$ is
+then $-\infty$ on up to a twentieth of the sample, and two algebraically identical evaluations
+agreeing to $5\times10^{-18}$ give $-0.35$ and $-0.70$ for the same log-correlation. The weighted
+mean is immune because those states carry no weight, and that is checkable rather than hoped for:
+every figure in the table above is identical to sixteen digits under a \texttt{log1p} evaluation.
+
+Under \eqref{eq:rule} the mass sits on states whose top-two gap is a tenth of average on Phoenix
+and a third on Zaxxon, and it is concentrated: the top decile of states carries $73.5$, $76.5$,
+$80.5$ and $79.5\%$ of $\sum D$. $\srank$, which the rule divides by and which \S\ref{sec:c8}
+originally named as what the agent would be paid to seek, shows next to no concentration on
+the three Phoenix checkpoints ($1.11$--$1.20$) and a real one ($3.15$) only on Zaxxon. So the induced reward pays
+the agent to stand where the two best actions are nearly tied in mean --- the cheapest place in
+the state space to be paid to stand, the regret of a wrong choice there being small by
+construction --- and the risk-seeking reading does not survive the measurement on either game.
+
+\emph{Candidate (D)'s row is the control, and it behaves exactly as the previous revision said
+(F) would.} At $k_0 = 4.4$ the bonus is proportional to the denominator --- $\gapbar$'s lift is
+$1.01$--$1.34$, against \eqref{eq:rule}'s $0.80$--$1.50$ --- it is spread rather than
+concentrated, its top decile carrying only $18$--$25\%$, and at $11$--$16\%$ of $\gapbar$ it is
+$50$--$110\times$ larger. \textbf{So the objection is sound, it was written about the right
+mechanism, and it was attached to the wrong candidate.} A rule that holds $k$ constant holds
+$\h(\pi)$ roughly constant with it, which is what makes its bonus track its denominator; a rule
+whose $k$ varies, as \eqref{eq:rule}'s does over the measured range of $\gapbar/\srank$, hands the
+exponential the decision instead.
+
+\paragraph{The Munchausen clip, counted two ways.} $l_0$ fires at $(s,a)$ iff
+$\gap_a + D > 1/\alpha$, so counted uniformly over state-action pairs at $\tau_\ell$ it fires on
+$3.5\%$, $22.0\%$ and $42.7\%$ of the Phoenix pairs and $0.1\%$ of the Zaxxon ones --- not the
+``never'' the previous revision recorded. Weighted by the behaviour that draws them, which is what
+the loss sees, it is zero to underflow under \eqref{eq:rule} and $3\times10^{-4}$ to
+$5\times10^{-3}$ even for candidate (D), whose $\tau$ reaches $0.09$--$0.21$. The previous
+revision's projection of $19\%$ of state-action pairs for its own coupled rule was the uniform
+count, which is not the distribution the loss draws from. \S\ref{sec:couple-case} is the identity
+that makes the second number small.
+
+\paragraph{Gating, and it is the finding with consequences beyond \S\ref{sec:c8}.} $D \le
+\tau\ln|\actions|$, and how much of that ceiling a state receives is set by its own gaps. Hold
+\emph{every} state at $\tau_\ell$ --- the most a coupled rule is ever permitted to pay --- and the
+fraction still receiving under a tenth of $\tau_\ell\ln|\actions|$ is $62.5\%$, $79.3\%$ and
+$80.1\%$ on Phoenix and $15.3\%$ on Zaxxon; under the rule itself it is $95$--$99\%$ on Phoenix.
+\textbf{The entropy channel delivers nothing to a state whose gaps are large, however unresolved
+that state actually is.} A reward-level bonus --- RND's, a count's --- is ungated: it is added
+whatever the critic believes. This bounds what \S\ref{sec:coupling} can buy before any run is
+spent, and it is the one reading here that is about family (I) rather than about
+\eqref{eq:rule}.
+
+\paragraph{What this measurement is not.} Every figure is taken at the gaps a \emph{decoupled}
+net learned, so it is a linearisation of a scheme that would move them --- Remark~\ref{rem:coupled-ok}
+is why that caveat is load-bearing rather than formal. It prices the objective's distortion and
+says nothing about the optimisation: a term two orders of magnitude below the gaps can still
+matter if it is systematic, and the only thing that settles that is the arm.
+
+
+\subsection{Staging}
+\label{sec:staging}
+
+\paragraph{Staging.} Three steps, the first two free.
+
+\begin{enumerate}
+  \item \textbf{Log the statistics in a training run} --- $\srank$, $\gapbar$, the percentiles
+  of their ratio and the floor's resting fraction --- under the unchanged behaviour policy. Free,
+  on the control path only as a diagnostic, and it answers the one question
+  \S\ref{sec:denoms} could not: the four checkpoints are four runs, and whether
+  $\gapbar/\srank$ is stable \emph{within} one run has not been seen.
+  \item \textbf{Score \eqref{eq:rule} at fixed weights} with \texttt{scripts/score\_policies.py},
+  as a cell beside the existing argmax / $0.003$ / $0.01$ / $0.03$ columns, at two or three
+  $(g, k_0)$. This is the same screen that retired the level criteria, applied to the rule that
+  replaced them. Its limit must be stated with its result: a fixed-weight readout says nothing
+  about which behaviour \emph{produces} better weights, so it is a screen and not a verdict. The
+  bar is to be within noise of the argmax cell --- $8$--$12\%$ standard error at $32$ episodes ---
+  not to beat it.
+  \item \textbf{One run}, against \texttt{phoenix\_2026-09-20\_02-21-56} so the comparison is
+  soft-against-soft at the best soft arm. Read it on $1$--$50$M, which is where the arms differ by
+  $3.2\times$ and where every case above says the rule binds. Log $k(s)$'s percentiles, the
+  fraction of states on the floor branch, the fraction on the $\tau_\ell$ ceiling, $\srank$'s
+  trajectory, and $\rho$ against the draw-only floor. Those five say which branch is operating and
+  whether either constant is misplaced, which nothing visible from the acting policy alone can.
+\end{enumerate}
+
+\section{Open questions}
+\label{sec:owed}
+
+\begin{itemize}
+  \item \textbf{\S\ref{sec:fixdraw}, before anything else.} Every epistemic denominator
+  measured --- $\dbar$, \eqref{eq:uasplit}'s $\tilde\sigma_{\mathrm{epi}}$, and Fox's squared
+  form built on it --- fails to transfer, and \S\ref{sec:denoms} locates the failure in the
+  draws rather than in the statistic. Nothing about \S\ref{sec:c10} or \S\ref{sec:c11} can be
+  decided until the draws are posterior samples, and after that all three are re-measurable
+  offline in minutes.
+  \item \textbf{Fox's exponent, once there is an epistemic $\sigma$ worth squaring.} Linear
+  against squared in the signal-to-noise ratio is a larger difference than anything else in this
+  document, and it is untestable while the denominator is the problem.
+  \item \textbf{Is the ordering disagreement tail-concentrated?} \S\ref{sec:meas-family} finds
+  the choice of family costing a constant factor when the centred advantage varies broadly and a
+  state-dependent one when it lives in a tail, and only the first is absorbed by $g$. The
+  measurement is
+  the distribution of $A_\beta(s,a)$ along the level axis on the existing checkpoints --- already
+  on disk as \texttt{results/spread\_*.npz}'s inputs --- and it decides whether a categorical head
+  may use a cheap two-point family or must carry a fuller one. It is a prerequisite for the
+  head, not a question about the temperature.
+  \item \textbf{$g$ across the change of head.} Admissibility is settled (\S\ref{sec:meas-family})
+  but scale is not (\S\ref{sec:meas-family}), so $g$ has to be re-measured whenever the family
+  moves --- including if
+  \texttt{IQN\_HUBER\_LOSS\_K} is lowered to recover the quantile estimand, which is an open item
+  in \texttt{btr.py} that was never connected to this one.
+  \item \textbf{$\gapbar/\srank$ inside a single run.} The four checkpoints of
+  \S\ref{sec:denoms} are four runs. That the ratio is stable across them is this document's
+  central empirical claim and it has never been watched as one run moves. \S\ref{sec:staging}'s
+  first stage is this and it is free.
+  \item \textbf{A third game.} Two games agreeing closely (\S\ref{sec:denoms}) is two games, and
+  this is the claim
+  most worth trying to break.
+  \item \textbf{Whether $\sret$ is a return dispersion at all.} It is flat across Phoenix
+  checkpoints while \texttt{quantile\_embedding}'s bias grows by orders (\S\ref{sec:denoms}).
+  Compare it
+  against the realised dispersion of Monte-Carlo returns from the same states.
+  \item \textbf{\eqref{eq:rule} scored at fixed weights} beside the existing $J(\tau)$ cells ---
+  \S\ref{sec:staging}, stage 2 --- and \textbf{$J(\tau)$ on a soft-trained Zaxxon net}, both curves
+  so far being Phoenix.
+  \item \textbf{\eqref{eq:distortion} evaluated on a contracting $\hat{s}$}, before any coupled
+  arm is run. \S\ref{sec:meas-couple} shows the entropy channel pays almost nothing to a state
+  with large gaps, so the question of whether a novelty signal survives that gating is answerable
+  in minutes with \texttt{scripts/coupling\_cost.py} and decides whether \S\ref{sec:coupling} is
+  worth a baseline at all. Behind \S\ref{sec:fixdraw}, like everything else epistemic.
+  \item \textbf{Whether a $\lambda$ read off the iterate converges at all}, which
+  \S\ref{sec:couple-fixedpoint} makes the gating item for every coupled scheme here and which
+  nothing in this document answers. Two jobs, both small, either informative alone:
+  recompute $\lambda(s)$ from the iterate on every sweep of \texttt{scripts/check\_mvi\_gap.py}'s
+  random finite MDPs and see whether the composed map converges and how that depends on $g$; and
+  measure $\srank$'s Lipschitz constant $L$ over replay states, which turns
+  \eqref{eq:couplebound} from indicative into quantitative. Everything about coupling waits on
+  the first of these and it is the cheapest item on this list.
+  \item \textbf{A coupled arm on a contracting denominator} (\S\ref{sec:coupling}), if the
+  previous two items clear. It is the only thing in this document that would make the sampling
+  rule into directed exploration rather than better-shaped dithering, and it is the one item here
+  that costs a baseline.
+  \item \textbf{The ceiling's sensitivity to $\tau_\ell$.} \S\ref{sec:meas-k} finds the ceiling
+  turning from a guard into a major operating branch under a modest change in $\tau_\ell$, a
+  constant chosen for the loss's reasons. Nothing anticipated the interaction and no run has
+  logged it. A higher gain holds it to a guard at either value and is the cheapest fix; coupling
+  removes the branch outright, which \S\ref{sec:couple-case} counts as one of its four arguments.
+  \item \textbf{Boltzmann--Gumbel in a discounted control problem.} \S\ref{sec:related} confirms
+  the bound is a stochastic-bandit result. Whether the $\sqrt{N_a}$ law or the suboptimality of
+  monotone schedules survives bootstrapping is not addressed anywhere read here, and it is the
+  only formal result near this design.
+\end{itemize}
+
+\end{document}

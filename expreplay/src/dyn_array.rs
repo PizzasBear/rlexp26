@@ -1,8 +1,4 @@
 //! [`DynArray`], an owned or borrowed `ndarray` whose element type is only known at runtime.
-//!
-//! The buffer stores observations and actions in whatever dtype the caller asked for, so every
-//! array it touches is one of these. [`for_all_dtypes`] is the single list of supported types:
-//! each declaration below is generated from it, so adding a dtype means editing that one macro.
 
 use std::marker::PhantomData;
 
@@ -12,10 +8,8 @@ use pyo3::{exceptions::PyTypeError, prelude::*};
 
 use crate::utils::{AllocationError, gather_batch, try_zeroed_vec, write_batch};
 
-/// Applies `$macro` to the full list of supported dtypes, as `Variant => rust_type` pairs.
-///
-/// Every dtype-dispatching declaration in the crate is generated from this one list, so a new
-/// element type is added here and nowhere else.
+/// Applies `$macro` to the supported dtypes, as `Variant => rust_type` pairs. Every
+/// dtype-dispatching declaration in the crate is generated from this list.
 macro_rules! for_all_dtypes {
     ($macro:ident) => {
         $macro! {
@@ -35,14 +29,9 @@ macro_rules! for_all_dtypes {
     };
 }
 
-/// The NumPy descriptor for one supported dtype, or `None` when this interpreter has no such
-/// dtype.
-///
-/// Only `bfloat16` can be missing. NumPy has none of its own: the one a `half::bf16` array uses
-/// is registered by whichever package provides it -- `ml_dtypes`, which JAX and PyTorch both pull
-/// in -- and rust-numpy's `Element` impl panics when nothing has. Looking it up by name instead
-/// makes its absence an ordinary missing dtype, which is what it is to a caller who asked for
-/// something else entirely.
+/// The NumPy descriptor for a supported dtype, or `None` where this interpreter has none. Only
+/// `bfloat16` can be missing: `ml_dtypes` registers it, and rust-numpy's `Element` impl panics
+/// without it.
 macro_rules! np_descr {
     (BF16, $py:expr, $ty:ty) => {
         PyArrayDescr::new($py, "bfloat16").ok()
@@ -60,20 +49,16 @@ macro_rules! def_dtype {
         }
 
         impl DType {
-            /// The NumPy descriptor for this dtype.
-            ///
-            /// Infallible, unlike the probe in [`Self::from_np`]: a `DType` naming a dtype
-            /// NumPy does not have is one that call could not have returned.
+            /// The NumPy descriptor for this dtype. Infallible: a `DType` names only a dtype
+            /// [`Self::from_np`] found.
             pub fn np<'py>(self, py: Python<'py>) -> Bound<'py, PyArrayDescr> {
                 match self {
                     $(Self::$variant => numpy::dtype::<$ty>(py),)+
                 }
             }
 
-            /// Matches a NumPy dtype, or anything NumPy can read as one, against the supported
-            /// list. Rejection names every dtype that would have been accepted, built from the
-            /// same list rather than written out by hand -- bar any this interpreter does not
-            /// have, which are no use to the caller either; see [`np_descr`].
+            /// Matches a NumPy dtype, or anything NumPy reads as one, against the supported list.
+            /// The rejection lists the supported dtypes this interpreter has.
             pub fn from_np<'py>(dtype: &Bound<'py, PyAny>) -> PyResult<Self> {
                 let py = dtype.py();
 
@@ -180,13 +165,7 @@ macro_rules! impl_dyn_array_methods {
         }
 
         impl DynArray {
-            /// Allocates a zeroed array of `shape`, failing rather than aborting if it does not
-            /// fit.
-            ///
-            /// This is by far the largest allocation the buffer makes -- for Atari-sized
-            /// observations it is three orders of magnitude bigger than everything else here put
-            /// together -- so it is the one that most needs to surface as a `MemoryError` instead
-            /// of taking the interpreter with it. See [`try_zeroed_vec`].
+            /// Allocates a zeroed array, failing instead of aborting; see [`try_zeroed_vec`].
             pub fn try_zeros(shape: &[usize], dtype: DType) -> Result<Self, AllocationError> {
                 let len = (shape.iter())
                     .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
@@ -222,11 +201,7 @@ macro_rules! impl_dyn_array_methods {
 
         }
 
-        /// [`write_batch`] over a pair of arrays whose dtype is only known at runtime.
-        ///
-        /// `dst` stays generic over its representation, as `src` is: the `DataMut` bound per dtype
-        /// is what says "anything writable", so a borrowed repr is accepted the day one exists
-        /// without this signature having to change to meet it.
+        /// [`write_batch`] over arrays whose dtype is only known at runtime.
         pub fn dyn_write_batch<DA, SA>(
             dst: &mut DynArrayBase<DA>,
             slots: &[u32],
@@ -241,9 +216,7 @@ macro_rules! impl_dyn_array_methods {
                 $((DynArrayBase::$variant(dst), DynArrayBase::$variant(src)) => {
                     write_batch(dst, slots, src)
                 })+
-                // Both sides come from the same stored array's dtype -- `src` is extracted with
-                // it at the boundary and `dst` is the array it was extracted for -- so a mismatch
-                // is a bug here rather than anything the caller can provoke.
+                // `src` was extracted as `dst`'s dtype.
                 (dst, src) => unreachable!(
                     "cannot write a {:?} batch into a {:?} array",
                     src.dtype(),
@@ -253,11 +226,7 @@ macro_rules! impl_dyn_array_methods {
         }
 
         /// Gathers `slots` out of a stored `[env, slot, ..tail]` array into a fresh
-        /// `[slots.len(), ..tail]` one of the same dtype.
-        ///
-        /// The gather sees one row per slot, so a stacked observation comes back with its stack
-        /// folded into the batch axis: `obs_stack` consecutive rows per draw, for the caller to
-        /// reshape. That reshape is free, since the array is allocated here and is contiguous.
+        /// `[slots.len(), ..tail]` one; see [`gather_batch`].
         pub fn dyn_gather<A: DynArrayRepr>(
             src: &DynArrayBase<A>,
             slots: &[u32],

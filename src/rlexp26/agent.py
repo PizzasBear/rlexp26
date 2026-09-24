@@ -41,8 +41,7 @@ class Policy(ABC):
     """
     An agent's behaviour, detached from its training: weights in, actions out.
 
-    Built once and reloaded, so that the evaluator can keep a network and an environment alive
-    across runs rather than rebuilding both every time.
+    Built once and reloaded, so the evaluator keeps one network alive across snapshots.
     """
 
     @abstractmethod

@@ -1,9 +1,6 @@
 """
-The network components this project builds for itself, kept free of BTR's hyperparameters so
-that the algorithm owns its numbers and this file owns only the shapes. Anything here should
-make sense to a different agent with different constants; ``btr.QNet`` is where they are chosen.
-
-``internals.SpectralNorm`` is vendored Flax rather than ours -- see that module's header.
+Network building blocks, free of BTR's hyperparameters; ``btr.QNet`` chooses the numbers.
+``internals.SpectralNorm`` is vendored Flax -- see that module's header.
 """
 
 import math
@@ -19,9 +16,12 @@ from .internals import SpectralNorm
 
 def adaptive_max_pool(x: jax.Array, output_size: Collection[int]) -> jax.Array:
     """
-    Applies adaptive max pooling to map arbitrary spatial dimensions to a fixed output_size.
-    Calculates fixed stride, kernel size, and padding values that satisfy standard
-    pooling output formulas: O = floor((H + pad - kernel) / stride) + 1
+    Max pooling to a fixed ``output_size``, with the stride, kernel size and padding that
+    satisfy O = floor((H + pad - kernel) / stride) + 1.
+
+    One (kernel, stride, padding) triple per axis, as BTR's paper describes it. This is not
+    ``torch.nn.AdaptiveMaxPool2d``, which BTR's code runs: torch overlaps per-cell windows
+    wherever the output size does not divide the input, and pools less (docs/reproduction.md).
     """
 
     strides = list[int]()
@@ -132,9 +132,6 @@ class ImpalaResSubBlock(nnx.Module):
     Impala Residual Sub-Block.
 
     Both convs are spectrally normalised and the enclosing block's stem conv is not, per BTR.
-    ``internals.SpectralNorm`` projects rather than mutates -- the ``# fix:`` at the end of its
-    ``__call__`` puts the raw weight back, which is what makes it the same algorithm as the
-    ``torch.nn.utils.spectral_norm`` BTR uses.
     """
 
     def __init__(
@@ -169,25 +166,13 @@ class ImpalaResSubBlock(nnx.Module):
 
 class ImpalaBlock(nnx.Module):
     """
-    ``spatial`` is the resolution this block is handed, which is also what its convolution
-    writes: the kernel is stride 1 under SAME padding. Only the LayerNorm needs it, and only to
-    size its scale and bias.
+    ``spatial`` is the resolution this block's stride-1 SAME convolution writes, which only the
+    LayerNorm needs, to size its parameters.
 
-    That LayerNorm takes its statistics over channels *and* positions together, one mean and
-    one variance per sample, and learns a scale and a bias per position. Flax spells the second
-    half of that as ``feature_axes``, which it fills by reshaping a flat parameter across the
-    axes named -- hence the ``height * width * out_features`` it is built with. Normalising the
-    map as a whole is what makes a single statistic meaningful across the three blocks, whose
-    resolutions differ by 16x.
-
-    ``epsilon`` is Flax's default 1e-6 and not ``torch.nn.LayerNorm``'s 1e-5, the one place the
-    two libraries disagree to any visible degree: against a PyTorch reference the forward pass
-    and both gradients agree to 1e-5 as it stands, and to 2e-7 were torch's value passed. That is
-    below what this trunk's own bfloat16 rounds away, so it stays a library default rather than
-    becoming a constant to keep matched. Flax's fused ``E[x^2] - E[x]^2`` variance is left alone
-    for the same kind of reason -- it is 3% faster per gradient step and indistinguishable from
-    the two-pass estimator until the mean of a feature map reaches a few hundred times its
-    spread, where this one runs at 0.2.
+    The LayerNorm takes one mean and variance per sample, over channels and positions together,
+    and learns a scale and bias per position -- hence the flat ``height * width * out_features``
+    that ``feature_axes`` reshapes. Its ``epsilon`` is Flax's 1e-6, not torch's 1e-5; the
+    difference is below bfloat16's rounding (docs/reproduction.md).
     """
 
     def __init__(
@@ -223,8 +208,7 @@ class ImpalaBlock(nnx.Module):
     def __call__(self, x: ArrayLike) -> jax.Array:
         x = jnp.asarray(x)
         x = self.conv0(x)
-        # Before the pool, and nowhere else in the block: the residual pair carries
-        # SpectralNorm and no normalisation of its own.
+        # Before the pool only: the residual pair carries SpectralNorm instead.
         if self.layer_norm0 is not None:
             x = self.layer_norm0(x)
         x = nnx.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding="SAME")  # type: ignore[no-untyped-call]
@@ -238,26 +222,15 @@ class ImpalaCNNLarge(nnx.Module):
     ``dtype`` is the convolutions' compute dtype, as everywhere in Flax. What it does and does
     not reach, for a 16-bit one:
 
-    - Parameters are float32 and stay float32. Each convolution casts a copy down for the call,
-      so nothing accumulates rounding across steps the way a 16-bit master weight would.
-    - The forward activations through the three blocks are ``dtype``, and so is what the trunk
-      hands back: casting is the caller's, since a trunk does not know what its features are
-      about to be used for. ``btr.QNet`` casts on the way into the head and ``btr._train_step``
-      on the way into the plasticity diagnostics, so neither the head, the loss nor a diagnostic
-      sees a 16-bit array.
-    - The backward pass is ``dtype`` as well: cuDNN accumulates the data and weight gradients in
-      float32 internally but writes both out in ``dtype``, so the gradient reaching a float32
-      parameter carries only ``dtype``'s precision. Measured against an otherwise identical
-      float32 net on one batch, bfloat16 puts 0.7% relative L2 error on the features and 0.9%
-      median (1.5% worst) on the trunk's weight gradients -- a few times bfloat16's own 0.39%
-      rounding unit, so an accumulation over layers rather than an amplification.
-    - SpectralNorm wraps the convolutions rather than sitting inside them, so its power
-      iteration and the normalised weight it projects with are float32 regardless.
+    - Parameters stay float32; each convolution casts a copy down for the call.
+    - The forward activations are ``dtype``, and so is the trunk's output: casting is the
+      caller's. ``btr.QNet`` casts before the head and ``btr._train_step`` before the
+      plasticity diagnostics.
+    - The backward pass is ``dtype`` too: cuDNN accumulates in float32 but writes the gradients
+      out in ``dtype``, so a float32 parameter's gradient carries ``dtype``'s precision.
+    - SpectralNorm wraps the convolutions, so its power iteration stays float32.
 
-    A 16-bit dtype is also what cuDNN's tensor cores read. Given float32 it runs them anyway, on
-    a TF32 copy it stages with a conversion pass per convolution, which costs a sixth of device
-    time and more than doubles what the convolutions themselves take. See btr.py's performance
-    block for both halves of that measurement.
+    docs/precision.md has what bfloat16 was measured to cost.
     """
 
     def __init__(
@@ -274,9 +247,7 @@ class ImpalaCNNLarge(nnx.Module):
         self.size_factor = size_factor
 
         n = self.size_factor
-        # Every block closes with a stride-2 SAME-padded pool, which halves each dimension
-        # rounding up, so the resolution the next one's convolution writes is this one's
-        # halved. 84 -> 42 -> 21 for an Atari frame.
+        # Each block's stride-2 SAME pool halves the resolution, rounding up.
         height, width = in_spatial
         self.block0 = ImpalaBlock(
             in_features,
@@ -308,10 +279,7 @@ class ImpalaCNNLarge(nnx.Module):
 
     @property
     def out_channels(self) -> int:
-        """
-        Feature maps in the trunk's output, before the flatten below folds them together with
-        the pooled positions. A diagnostic that counts convolutional neurons counts these.
-        """
+        """Feature maps in the trunk's output, before the flatten folds in the positions."""
         return self.size_factor * 32
 
     @property

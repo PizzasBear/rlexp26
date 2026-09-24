@@ -8,7 +8,7 @@ from collections import deque
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, closing, contextmanager
 from types import FrameType
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, NewType
 
 import gymnasium as gym
 import jax
@@ -17,31 +17,31 @@ from etils.epath import Path
 from gymnasium.spaces import Box, MultiDiscrete
 from orbax.checkpoint import v1 as ocp
 from tensorboardX import SummaryWriter
+from tensorboardX.summary import hparams
 
 from . import ale, btr
 from .agent import Agent, EnvStep
-from .evaluate import EvalResult, Evaluator
+from .evaluate import EVAL_NUM_ENVS, EvalResult, Evaluator
+
+# tensorboardX.summary.Summary comes from a generated protobuf module pyright cannot see into.
+Summary = NewType("Summary", object)
 
 SEED = 0
-EVAL_SEED = SEED + 1  # fixed, so every evaluation replays the same no-op starts
+EVAL_SEED = SEED + 1
 NUM_ENVS = 64  # environments stepped in lockstep, and the loop's batch of actions
 LOG_FREQ = 100  # env-loop iterations between rate/throughput writes
 CHECKPOINT_FREQ = 3125  # gradient steps between checkpoints
 CHECKPOINT_KEEP = 3  # checkpoints kept on disk; the rest are garbage collected
-EVAL_FREQ = 3125  # gradient steps between evaluation runs
+EVAL_FREQ = 3125  # gradient steps between weight handovers to the evaluator
 STATS_DRAIN_LAG = 2  # env-loop iterations a gradient step's diagnostics stay in flight
 
 
 @contextmanager
 def interruptible() -> Generator[Callable[[], bool]]:
     """
-    Turn Ctrl-C into a flag the training loop reads between iterations, so that the shutdown
-    lands where the device queue is drained and nothing is half applied. A raised
-    ``KeyboardInterrupt`` would not even arrive as itself: JAX catches it while hashing a jitted
-    call's pytree metadata and re-raises it as a ``ValueError`` about unhashable fields.
-
-    A second Ctrl-C hits the restored default handler and ends the loop body, but is caught here
-    rather than re-raised, so the caller's teardown still runs.
+    Turn Ctrl-C into a flag the training loop reads between iterations, so the shutdown lands
+    with nothing half applied. A raw ``KeyboardInterrupt`` inside a jitted call surfaces as a
+    ``ValueError`` from JAX. A second Ctrl-C goes to the restored default handler and propagates.
     """
     interrupted = False
     previous = signal.getsignal(signal.SIGINT)
@@ -50,35 +50,28 @@ def interruptible() -> Generator[Callable[[], bool]]:
         nonlocal interrupted
         interrupted = True
         signal.signal(signal.SIGINT, previous)
+        print()
         print(
-            "\nINTERRUPTED -- finishing the iteration and checkpointing (^C again to abort)"
+            "INTERRUPTED: finishing the iteration and checkpointing (^C again to abort)"
         )
 
     signal.signal(signal.SIGINT, on_sigint)
     try:
         yield lambda: interrupted
     except KeyboardInterrupt:
-        print("\nABORTED")
+        print()
+        print("ABORTED")
+        raise
     finally:
         signal.signal(signal.SIGINT, previous)
 
 
 class SinceLastSavePolicy:
     """
-    Save once ``interval`` gradient steps have passed since the newest checkpoint, and never
-    while a save is still writing. Orbax's ``SaveDecisionPolicy`` is a runtime-checkable
-    protocol, so this satisfies it by shape rather than by inheritance.
-
-    Orbax's ``FixedIntervalPolicy`` tests ``step % interval`` instead, which an agent taking
-    several gradient steps an iteration -- a replay ratio above one step per iteration -- steps
-    over rather than lands on, and at an even number of steps an iteration it would never save
-    at all. The evaluation below is paced by the same kind of window for the same reason.
-
-    Skipping the save while one is in progress is what keeps the loop off the disk: dropping a
-    checkpoint costs nothing, blocking on the write costs a step. With nothing on disk yet there
-    is no interval to measure, so the first step asked about is saved -- orbax's own
-    ``InitialSavePolicy`` behaviour, and it puts something resumable on disk before an interval
-    has passed.
+    Orbax save decision policy: save once ``interval`` gradient steps have passed since the
+    newest checkpoint, or at the first step if there is none, and never while a save is still
+    writing. ``FixedIntervalPolicy``'s ``step % interval`` would be stepped over by an agent
+    taking several gradient steps an iteration.
     """
 
     def __init__(self, interval: int) -> None:
@@ -100,36 +93,33 @@ class SinceLastSavePolicy:
 
 class PendingStats(NamedTuple):
     """
-    One gradient step's diagnostics, still in flight on the device. Leaving them there for
-    STATS_DRAIN_LAG iterations is what lets the step overlap ``env.step``; the counter travels
-    with them so they land on the curve where they were computed rather than where they were
-    read, and it is what the drain measures their age in.
+    One gradient step's diagnostics, still on the device, with the env step they were computed
+    at: where they land on the curve, and what the drain measures their age by.
     """
 
     values: dict[str, jax.Array]
     env_steps: int
 
 
+# Scalar tags the HParams tab shows beside the constants; they must be series the run writes.
+HPARAM_METRICS = (
+    "eval/returns",
+    "eval/returns_mean",
+    "eval/returns_max",
+    "run/training_returns",
+    "run/env_steps_per_second",
+)
+
+
 def write_hparams(
-    writer: SummaryWriter,
-    hyperparameters: dict[str, bool | int | float | str],
-    metrics: dict[str, float],
-    global_step: int,
-) -> None:
+    writer: SummaryWriter, hyperparameters: dict[str, bool | int | float | str]
+) -> Summary:
     """
-    Record the run's hyperparameters and its closing metrics, so TensorBoard's HParams tab can
-    line runs up against each other rather than leaving the constants that produced a curve to
-    memory.
-
-    The agent names its own hyperparameters and the env protocol goes in wholesale; everything
-    else is named explicitly here, since the rest of the run's constants are logging and
-    checkpointing knobs that do not change what a run means.
-
-    ``add_hparams`` writes into a sub-directory of the writer's logdir, which is why this is
-    called once at shutdown with real values rather than at startup with placeholders: the
-    hparams plugin reads a session's metrics from that session's own run and the runs below it,
-    never from the parent, so the numbers in the table are the ones passed here and nothing
-    else. The scalars above go on living in the run proper; this is the summary row.
+    Write the HParams experiment and session start into the run's own event file, and return
+    the session end for the caller to write at shutdown. Unlike ``add_hparams``, which writes a
+    separate run in a sub-directory, this survives a run that dies, and the metrics are read by
+    tag from the run's own scalars. A resume writes a second session start; the plugin reads the
+    later one.
     """
     params: dict[str, bool | str | float | int] = dict(hyperparameters)
     params |= {
@@ -141,9 +131,14 @@ def write_hparams(
     params["run/seed"] = SEED
     params["run/num_envs"] = NUM_ENVS
 
-    # Fixed name, not add_hparams' default timestamp, so a resumed run rewrites the same session
-    # rather than opening a second one beside it.
-    writer.add_hparams(params, metrics, name="hparams", global_step=global_step)
+    # ``hparams`` reads only the keys of the metrics.
+    experiment, session_start, session_end = hparams(
+        params, dict.fromkeys(HPARAM_METRICS, 0.0)
+    )
+    assert writer.file_writer is not None
+    writer.file_writer.add_summary(experiment)
+    writer.file_writer.add_summary(session_start)
+    return session_end
 
 
 def main() -> None:
@@ -163,9 +158,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     resume: Path | None = args.resume
-    # Counted in gradient steps taken by this process rather than in iterations: that is what
-    # the rest of the run paces itself by, and it puts the window past the buffer fill -- which
-    # a resumed run pays again -- without having to know how long that takes.
+    # In gradient steps taken by this process, so the window falls past the buffer fill.
     profile_start, profile_count = 0, 0
     if args.profile:
         start, _, count = args.profile.partition(":")
@@ -174,9 +167,7 @@ def main() -> None:
         profile_start, profile_count = int(start), int(count)
 
     with ExitStack() as stack:
-        # closing() rather than enter_context: gymnasium gives Env a context manager but not
-        # VectorEnv. Registered in the expression that builds it, so nothing below can leave
-        # ALE's threads running.
+        # closing(): gymnasium's VectorEnv is not a context manager.
         env: ale.AtariVecEnv = stack.enter_context(
             closing(gym.make_vec(ale.ENV_ID, num_envs=NUM_ENVS, **ale.PROTOCOL))
         )
@@ -189,8 +180,7 @@ def main() -> None:
         assert (env.action_space.nvec == num_actions).all()
 
         obs_stack, obs_height, obs_width = env.single_observation_space.shape
-        # The one place the algorithm is named. Everything below asks the agent what it needs
-        # rather than reaching into it.
+        # The one place the algorithm is named.
         agent: Agent = btr.BTR(
             num_actions,
             (obs_stack, obs_height, obs_width),
@@ -198,9 +188,8 @@ def main() -> None:
             seed=SEED,
         )
 
-        # A resumed run writes back into the directories the original one used, so that its
-        # checkpoint steps stay one increasing sequence -- orbax refuses to write a step twice --
-        # and TensorBoard shows one curve rather than two overlapping ones.
+        # A resumed run writes into the original run's directories, continuing one checkpoint
+        # sequence and one curve.
         if resume is None:
             now_str = dt.datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
             run_dir = Path(f"./checkpoints/{ale.ENV_NAME}_{now_str}").absolute()
@@ -208,13 +197,8 @@ def main() -> None:
             run_dir = resume.absolute()
         run_name = run_dir.name
 
-        # Step-numbered directories rather than one path overwritten in place: each is written to
-        # a tmp directory and renamed on completion, so an interrupt cannot destroy what is
-        # already on disk the way an overwrite-in-place would.
-        #
-        # The pyright ignore is upstream's annotation, not this argument: orbax types the
-        # parameter against its v1 protocol, which its own v0 policy classes do not nominally
-        # satisfy.
+        # The pyright ignore is orbax's: its v0 policy classes do not nominally satisfy the v1
+        # protocol the parameter is typed against.
         keep_policy = ocp.training.preservation_policies.LatestN(CHECKPOINT_KEEP)
         ckptr: ocp.training.Checkpointer = stack.enter_context(
             ocp.training.Checkpointer(
@@ -237,19 +221,17 @@ def main() -> None:
             num_env_steps = restored["num_env_steps"]
             print(f"RESUMED {run_name} at {agent.num_updates} gradient steps")
 
-        # Named here rather than inside the writer: a profile trace is written beside the
-        # scalars, under the same run, so TensorBoard shows both together.
+        # Shared with the profiler, so TensorBoard shows the trace beside the scalars.
         logdir = f"./logs/{run_name}"
         writer = stack.enter_context(SummaryWriter(logdir))
+        hparams_session_end = write_hparams(writer, agent.hyperparameters)
         evaluator = stack.enter_context(
             closing(Evaluator(agent.make_policy, EVAL_SEED))
         )
 
-        # Seeded here rather than in ale.PROTOCOL: ale_py 0.12 dropped AtariVectorEnv's seed
-        # argument, and gym.make_vec forwards the protocol to that constructor verbatim.
+        # Seeded here, not in ale.PROTOCOL: ale_py 0.12's AtariVectorEnv takes no seed argument.
         obs, _info = env.reset(seed=SEED)
-        # After the restore, so that an agent sizing or seeding its memory from the checkpoint
-        # has it.
+        # After the restore, which init may read.
         agent.init(obs)
 
         actions, extras = agent.act(obs, num_env_steps=num_env_steps)
@@ -257,33 +239,20 @@ def main() -> None:
 
         stats_queue = deque[PendingStats]()
         num_updates = agent.num_updates
-        # A window rather than a modulo test on num_updates, which an agent that learns in
-        # batches steps over rather than landing on.
         last_eval_updates = num_updates
+        eval_batch: list[EvalResult] = []
         log_every_env_steps = LOG_FREQ * env.num_envs
-        # Not checkpointed: the returns run into episodes a resumed run abandons at the env.reset
-        # above, and the rate is measured from wherever this process started.
         curr_returns = np.zeros(env.num_envs)
         last_log_time, last_log_env_steps = time.perf_counter(), num_env_steps
-        # Whatever agent.act asks to have logged about the actions, summed over the window
-        # rather than sampled on the logging iteration: the transfer rides a sync the loop
-        # already pays, so averaging every iteration is free.
+        # agent.act's extras, averaged over the logging window.
         act_sums: dict[str, float] = {}
         act_count = 0
-        # The closing row of the HParams table. last_eval is the only reason an EvalResult
-        # outlives its drain; both stay None if the run ends before producing one.
-        last_eval: EvalResult | None = None
-        last_training_returns: float | None = None
 
         def drain_stats(lag: int) -> None:
             """
             Write the diagnostics of every gradient step dispatched at least ``lag`` iterations
-            ago; a shutdown passes 0.
-
-            Iterations rather than a queue depth, because entries arrive on the agent's logging
-            cadence and can be a hundred apart. A step dispatched in iteration i is still running
-            through i + 1 -- the foot of the loop waits only on the act before it -- and is
-            necessarily done by i + 2, since the act dispatched after it has been waited on.
+            ago. A step dispatched in iteration i is done by i + 2, once the act dispatched after
+            it has been waited on.
             """
             while stats_queue and (
                 lag * env.num_envs <= num_env_steps - stats_queue[0].env_steps
@@ -294,22 +263,15 @@ def main() -> None:
 
         def checkpointables() -> dict[str, Any]:
             """
-            Everything a resumed run cannot rebuild for itself, read at the moment of the call.
-
-            The agent's half is aliased rather than cloned, unlike ``Agent.policy_weights``:
-            ``save_checkpointables_async`` walks the pytree on the calling thread and defers only
-            the copy, so a later gradient step cannot change what is written. Verified by saving
-            async, mutating immediately, and reading back the old values.
+            Everything a resumed run cannot rebuild, read at the call. Aliased, not cloned:
+            ``save_checkpointables_async`` takes the arrays on the calling thread.
             """
             return agent.checkpointables() | {"num_env_steps": num_env_steps}
 
         def checkpoint_final() -> None:
             """
-            The checkpoint that closes the run out, written past the save decision policy, since
-            the newest on disk is up to CHECKPOINT_FREQ gradient steps old when the loop stops.
-
-            Guarded because orbax refuses to write a step twice, which a run stopped before its
-            first update would do. An interrupt mid-save costs only this checkpoint.
+            The closing checkpoint, forced past the save decision policy. Skipped when the step
+            is already on disk, since orbax refuses to write a step twice.
             """
             latest = ckptr.latest
             if num_updates == 0 or (latest is not None and num_updates <= latest.step):
@@ -322,52 +284,30 @@ def main() -> None:
                 print("ABORTED -- keeping the newest complete checkpoint")
 
         def summarise_run() -> None:
-            """
-            Close the run out in the HParams tab. Registered on the stack rather than run after
-            the loop so that an interrupt -- which is how most runs end -- still lands the row,
-            and registered before checkpoint_final so LIFO puts it after that write and while the
-            writer above is still open.
-            """
-            metrics: dict[str, float] = {}
-            if last_eval is not None:
-                metrics["eval/returns"] = float(last_eval.returns.mean())
-                metrics["eval/returns_max"] = float(last_eval.returns.max())
-            if last_training_returns is not None:
-                # Recorded rather than compared: it is the clipped mean over whichever envs
-                # finished in the final window, so it says what the run was doing at the end,
-                # not how well.
-                metrics["run/training_returns"] = last_training_returns
-            write_hparams(writer, agent.hyperparameters, metrics, num_env_steps)
+            """Close the run's HParams session."""
+            assert writer.file_writer is not None
+            writer.file_writer.add_summary(hparams_session_end)
 
         stack.callback(summarise_run)
-        # Between the two on the unwind: the last scalars reach the curve before the closing
-        # row is written, and after the checkpoint, which is the write worth losing least.
+        # Unwound in reverse: checkpoint, then the last scalars, then the session end, all
+        # while the writer is open.
         stack.callback(drain_stats, 0)
         stack.callback(checkpoint_final)
 
         profiling = False
-        # The gradient step the trace window opens on, fixed at the first one this process
-        # takes rather than read off --profile directly: --resume restores num_updates past
-        # profile_start, and the buffer refill that follows advances it not at all, so a window
-        # cut straight from it would open immediately and span the whole refill.
+        # Fixed at this process's first gradient step, so a resume's refill is not traced.
         profile_at: int | None = None
 
         def stop_profile() -> None:
             """
-            Close the trace window, if one is open.
-
-            Registered on the stack as well as called from the loop, and first on the unwind so
-            that the teardown below stays outside the window: JAX writes the trace out in
-            stop_trace, so an interrupt taken mid-window -- which is how a run usually ends --
-            would otherwise pay the profiling overhead and leave nothing behind.
+            Close the trace window, if one is open. Also on the stack, first to unwind, so an
+            interrupted window is still written and the teardown stays outside it.
             """
             nonlocal profiling
             if not profiling:
                 if profile_count:
                     print("PROFILE NOT TAKEN -- the run ended before the window opened")
                 return
-            # As at the open: the window ends where the device is idle, or the kernels
-            # still in flight land outside it and the last iterations read as free.
             jax.block_until_ready(checkpointables())  # type: ignore[no-untyped-call]
             jax.profiler.stop_trace()  # type: ignore[no-untyped-call]
             profiling = False
@@ -376,17 +316,13 @@ def main() -> None:
         stack.callback(stop_profile)
         interrupted = stack.enter_context(interruptible())
 
-        evaluator.submit(agent.policy_weights(), num_updates, num_env_steps)
+        evaluator.submit(agent.policy_weights(), num_env_steps)
 
         while not interrupted():
             if profile_count and profile_at is not None:
                 if not profiling and num_updates >= profile_at:
-                    # Both ends of the window wait on the device, or it opens over the tail of
-                    # a step dispatched before it and the per-iteration totals inside it are
-                    # the wrong shape. The agent's state is what the last gradient step wrote,
-                    # so waiting on that waits on the step. Not jax.effects_barrier: it blocks
-                    # on ordered effects, of which this program has none, so it returns without
-                    # the device having done anything.
+                    # Both ends of the window wait for the device to go idle.
+                    # jax.effects_barrier would not: there are no ordered effects to wait on.
                     jax.block_until_ready(checkpointables())  # type: ignore[no-untyped-call]
                     jax.profiler.start_trace(str(logdir))
                     profiling = True
@@ -404,15 +340,13 @@ def main() -> None:
             curr_returns += rewards
             done = np.logical_or(terminated, truncated)
             if done.any():
-                last_training_returns = float(curr_returns[done].mean())
                 writer.add_scalar(
                     "run/training_returns",
-                    last_training_returns,
+                    float(curr_returns[done].mean()),
                     global_step=num_env_steps,
                 )
                 curr_returns[done] = 0.0
 
-            # Drained here, and only here until shutdown.
             drain_stats(STATS_DRAIN_LAG)
 
             with jax.profiler.TraceAnnotation("agent.observe"):
@@ -428,24 +362,29 @@ def main() -> None:
                     )
                 )
 
+            # Each episode lands where it ended.
             for result in evaluator.drain():
-                last_eval = result
                 writer.add_scalar(
-                    "eval/returns",
-                    result.returns.mean(),
-                    global_step=result.num_env_steps,
+                    "eval/returns", result.episode_return, global_step=num_env_steps
                 )
-                writer.add_scalar(
-                    "eval/returns_max",
-                    result.returns.max(),
-                    global_step=result.num_env_steps,
-                )
-                print(
-                    f"EVAL {result.num_updates} gradient steps: "
-                    f"{result.returns.mean():.1f} mean over {result.returns.size} episodes "
-                    f"(min {result.returns.min():.0f}, max {result.returns.max():.0f}, "
-                    f"{result.seconds:.0f}s)"
-                )
+                eval_batch.append(result)
+                if len(eval_batch) == EVAL_NUM_ENVS:
+                    batch = np.array([r.episode_return for r in eval_batch])
+                    # Disjoint batches of EVAL_NUM_ENVS, the shape a snapshot evaluation had,
+                    # so these stay comparable with runs from before the continuous fleet.
+                    writer.add_scalar(
+                        "eval/returns_mean", batch.mean(), global_step=num_env_steps
+                    )
+                    writer.add_scalar(
+                        "eval/returns_max", batch.max(), global_step=num_env_steps
+                    )
+                    print(
+                        f"EVAL {num_updates} gradient steps: {batch.mean():.1f} mean over "
+                        f"{batch.size} episodes (min {batch.min():.0f}, "
+                        f"max {batch.max():.0f}, "
+                        f"{np.mean([r.seconds for r in eval_batch]):.0f}s each)"
+                    )
+                    eval_batch.clear()
 
             if num_env_steps - last_log_env_steps >= log_every_env_steps:
                 now = time.perf_counter()
@@ -457,9 +396,7 @@ def main() -> None:
                 writer.add_scalar(
                     "run/env_steps_per_second", fps, global_step=num_env_steps
                 )
-                # The actions actually taken, so these are properties of the behaviour policy
-                # rather than of the learned q. They trail by one iteration, the last act() of
-                # the window still being in flight until the device_get at the foot of the loop.
+                # About the actions taken, trailing by the one act still in flight.
                 if act_count:
                     for name, total in act_sums.items():
                         writer.add_scalar(
@@ -472,8 +409,6 @@ def main() -> None:
                 for name, scalar in agent.stats().items():
                     writer.add_scalar(name, scalar, global_step=num_env_steps)
 
-            # Zero gradient steps while the agent is still collecting, which is also why every
-            # frequency below is inside this branch: they are all counted in gradient steps.
             with jax.profiler.TraceAnnotation("agent.learn_step"):
                 grad_steps, learn_stats = agent.learn_step()
             if grad_steps:
@@ -481,27 +416,16 @@ def main() -> None:
                 if profile_count and profile_at is None:
                     profile_at = num_updates + profile_start
 
-                # The agent reports on its own cadence and hands back nothing on the steps
-                # between, so only the steps it means to write pay a transfer.
                 if learn_stats:
                     jax.copy_to_host_async(learn_stats)  # type: ignore[no-untyped-call]
                     stats_queue.append(
                         PendingStats(values=learn_stats, env_steps=num_env_steps)
                     )
 
-                # An evaluation runs until its slowest env finishes, bounded only by ALE's
-                # 108k-frame truncation, so it really can outlast EVAL_FREQ gradient steps.
                 if num_updates - last_eval_updates >= EVAL_FREQ:
                     last_eval_updates = num_updates
-                    if not evaluator.submit(
-                        agent.policy_weights(), num_updates, num_env_steps
-                    ):
-                        print(
-                            f"EVAL SKIPPED at {num_updates}: the previous one is still running"
-                        )
+                    evaluator.submit(agent.policy_weights(), num_env_steps)
 
-                # should_save also answers False while a previous save is still writing, which is
-                # right: dropping a checkpoint costs nothing, blocking on the disk costs a step.
                 if ckptr.should_save(num_updates):
                     ckptr.save_checkpointables_async(num_updates, checkpointables())
 

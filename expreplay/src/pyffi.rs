@@ -1,17 +1,8 @@
-//! The Python boundary: the `expreplay` extension module and everything that exists only to
-//! serve it.
+//! The Python boundary: the `expreplay` module and [`PyReplayBuffer`], a thin wrapper that
+//! converts arrays, dtypes and errors and decides nothing itself.
 //!
-//! [`PyReplayBuffer`] is a thin wrapper over [`ReplayBuffer`]. Its job is to convert -- NumPy
-//! arrays into `ndarray` views, dtypes into [`DType`], a [`ReplayBufferError`] into the exception
-//! a Python caller expects -- and then to get out of the way. Nothing here decides anything about
-//! how the buffer behaves; if a rule needs enforcing it belongs in the core, and so does the
-//! reasoning behind it.
-//!
-//! The doc comments below are the exception, because pyo3 turns them into each method's Python
-//! `__doc__`: they are what `help(ReplayBuffer)` prints. So they are written for a Python reader
-//! -- plain prose, no rustdoc link syntax, no `Self::` paths -- and kept to what that reader
-//! needs at the prompt. The full account of *why* each rule holds stays on [`ReplayBuffer`]'s own
-//! methods, and `expreplay.pyi` carries the version a type checker and an IDE read.
+//! The pymethods' doc comments become Python `__doc__`s, so they are written for a Python reader,
+//! with no rustdoc links. `expreplay.pyi` carries the fuller version.
 
 use std::num::NonZero;
 
@@ -47,11 +38,10 @@ impl From<AllocationError> for PyErr {
 impl From<sampling::DrawError> for PyErr {
     fn from(value: sampling::DrawError) -> Self {
         match value {
-            // The caller asked for a draw the buffer cannot serve.
             sampling::DrawError::TooSmall | sampling::DrawError::NoPriorities => {
                 PyValueError::new_err(value.to_string())
             }
-            // Nothing the caller passed is wrong; the buffer's own state is degenerate.
+            // The buffer's own state is degenerate, not the caller's arguments.
             sampling::DrawError::Exhausted => PyRuntimeError::new_err(value.to_string()),
         }
     }
@@ -71,28 +61,17 @@ impl From<ReplayBufferError> for PyErr {
     }
 }
 
-/// How an argument of one dtype arrives from Python.
-///
-/// [`PyArrayLikeDyn`] takes a NumPy array of exactly this dtype as a borrow, and falls back to
-/// rebuilding anything else NumPy can read -- a list, a JAX array -- element by element through
-/// the sequence protocol. That fallback goes via `Vec<T>`, which pyo3 cannot produce for either
-/// half-precision type: there is no conversion from a Python float to one. `f16` and `bf16`
-/// therefore take a real NumPy array of their own dtype and nothing else, which is what the
-/// caller should be passing anyway.
-///
-/// Both types expose `as_array`, so only the type named here differs between the two paths.
+/// How an argument of one dtype arrives from Python. [`PyArrayLikeDyn`] borrows an array of
+/// exactly this dtype and otherwise rebuilds the argument element by element through `Vec<T>`,
+/// which pyo3 cannot do for `f16` or `bf16`; those take a real array of their own dtype only.
 macro_rules! dyn_py_arg {
     (BF16, $lt:lifetime, $ty:ty) => { numpy::PyReadonlyArrayDyn<$lt, $ty> };
     (F16, $lt:lifetime, $ty:ty) => { numpy::PyReadonlyArrayDyn<$lt, $ty> };
     ($variant:ident, $lt:lifetime, $ty:ty) => { PyArrayLikeDyn<$lt, $ty> };
 }
 
-/// The `TypeError` an argument of the wrong dtype gets.
-///
-/// pyo3's own reads `'ndarray' object is not an instance of 'ndarray'` -- accurate, in that the
-/// array handed over is not an array of the stored dtype, and unreadable. Name the argument, what
-/// the buffer stores and what turned up instead, which for a half-precision buffer also explains
-/// the two dtypes that refuse a list; see [`dyn_py_arg`].
+/// The `TypeError` for an argument of the wrong dtype, naming the argument, the stored dtype and
+/// what arrived. pyo3's own reads `'ndarray' object is not an instance of 'ndarray'`.
 fn wrong_dtype(name: &str, dtype: DType, obj: &Bound<'_, PyAny>) -> PyErr {
     let py = obj.py();
     let got = match obj.cast::<PyUntypedArray>() {
@@ -111,18 +90,14 @@ fn wrong_dtype(name: &str, dtype: DType, obj: &Bound<'_, PyAny>) -> PyErr {
 
 macro_rules! def_dyn_py_array_like {
     ($($variant:ident => $ty:ty),+ $(,)?) => {
-        /// A NumPy argument whose dtype is only known at runtime, extracted as whichever one the
-        /// buffer stores. See [`dyn_py_arg`] for what each variant will accept.
+        /// A NumPy argument extracted as whichever dtype the buffer stores; see [`dyn_py_arg`].
         pub enum DynPyArrayLike<'py> {
             $($variant(dyn_py_arg!($variant, 'py, $ty)),)+
         }
 
         impl<'py> DynPyArrayLike<'py> {
-            /// Extracts `obj` as `dtype`, raising `TypeError` if it cannot be read as one.
-            ///
-            /// `name` is the argument's Python name, for the error. It matches the one the core's
-            /// shape errors use, so a caller who got the dtype wrong and a caller who got the
-            /// shape wrong are told about the same argument by the same name.
+            /// Extracts `obj` as `dtype`, raising `TypeError` if it cannot be read as one. `name` is
+            /// the argument's Python name, as the core's shape errors use it.
             pub fn extract(name: &str, dtype: DType, obj: &Bound<'py, PyAny>) -> PyResult<Self> {
                 Ok(match dtype {
                     $(DType::$variant => Self::$variant(
@@ -160,18 +135,14 @@ pub struct PyReplayBuffer(ReplayBuffer);
 impl PyReplayBuffer {
     /// Allocate a buffer holding ``num_envs * env_capacity`` transitions.
     ///
-    /// ``obs_shape`` and ``act_shape`` describe a single observation and action; the environment
-    /// and slot axes are prepended internally. Both dtypes accept any of uint8/16/32/64,
-    /// int8/16/32/64, float16/32/64, and default to float32 for observations and uint8 for
-    /// actions.
+    /// ``obs_shape`` and ``act_shape`` describe one observation and action. Either dtype may be
+    /// uint8/16/32/64, int8/16/32/64, float16, bfloat16, float32 or float64; they default to
+    /// float32 observations and uint8 actions.
     ///
-    /// ``obs_stack`` makes ``sample`` return that many consecutive frames per observation and
-    /// lets ``save_step`` accept a stacked observation directly; only one frame per slot is
-    /// stored either way. ``use_prios`` enables prioritised sampling, and ``stratified``
-    /// (defaulting to ``use_prios``, and requiring it) spreads a batch over the priority mass.
-    /// ``max_prio`` seeds the priority new transitions are given, for a run picking up where a
-    /// checkpointed one left off; it is read-only afterwards. n-step returns are asked for per
-    /// draw, in ``sample``, not here.
+    /// ``obs_stack`` makes ``sample`` return that many frames per observation and lets
+    /// ``save_step`` take a stacked one. ``use_prios`` enables prioritised sampling, and
+    /// ``stratified`` (defaulting to ``use_prios``, which it requires) spreads a batch over the
+    /// priority mass. ``max_prio`` seeds the priority new transitions are given.
     ///
     /// Raises MemoryError if the buffer does not fit, OverflowError if its flat index would not
     /// fit in a uint32, and ValueError for out-of-range parameters.
@@ -208,8 +179,7 @@ impl PyReplayBuffer {
         let obs_dtype = obs_dtype.map_or(Ok(DType::F32), DType::from_np)?;
         let act_dtype = act_dtype.map_or(Ok(DType::U8), DType::from_np)?;
 
-        // `max_prio` and `max_prio_decay` are left unset rather than defaulted here, so that the
-        // numbers themselves live in `ReplayBufferSpec::new` and nowhere else.
+        // Unset rather than defaulted, so the defaults live only in `ReplayBufferSpec::new`.
         let mut spec = ReplayBufferSpec::new(&obs_shape, obs_dtype, &act_shape, act_dtype)
             .with_obs_stack(obs_stack)
             .with_use_prios(use_prios)
@@ -222,17 +192,14 @@ impl PyReplayBuffer {
             spec = spec.with_max_prio_decay(max_prio_decay);
         }
 
-        // The observation array alone is routinely tens of gigabytes, and zeroing it touches no
-        // Python object, so the allocation runs with the GIL released.
+        // Zeroing tens of gigabytes touches no Python object.
         let buf = py.detach(|| ReplayBuffer::new(num_envs, env_capacity, &spec))?;
 
         Ok(Self(buf))
     }
 
-    /// Number of transitions stored, summed across environments.
-    ///
-    /// Counts everything written, which is more than ``sample`` can draw: the slots around each
-    /// environment's write head are excluded from sampling but included here.
+    /// Number of transitions written, summed across environments. Includes the unsamplable slots
+    /// around each write head, so it is more than ``sample`` can draw.
     fn __len__(&self) -> usize {
         self.0.len()
     }
@@ -284,9 +251,7 @@ impl PyReplayBuffer {
     }
 
     /// Whether a prioritised batch is spread over the priority mass rather than drawn
-    /// independently. Settable; changes only how the draws correlate, never what is stored.
-    ///
-    /// Setting it on a buffer built without ``use_prios`` raises ValueError.
+    /// independently. Settable; raises ValueError on a buffer without ``use_prios``.
     #[getter]
     fn stratified(&self) -> bool {
         self.0.stratified()
@@ -297,22 +262,15 @@ impl PyReplayBuffer {
         Ok(self.0.set_stratified(stratified)?)
     }
 
-    /// The priority a newly written transition is given; see ``update_prios``.
-    ///
-    /// This is the scale ``sample`` reports its priorities against, so an importance-sampling
-    /// weight normalised against the whole buffer rather than one batch divides by this.
-    ///
-    /// Its starting value is a constructor argument, so that a resumed run does not hand its
-    /// refilled buffer the priorities of a fresh one, but it is not settable afterwards: every
-    /// priority already stored was written against the value in force at the time.
+    /// The priority a newly written transition is given, and the scale ``sample``'s priorities are
+    /// reported against. Read-only.
     #[getter]
     fn max_prio(&self) -> f32 {
         self.0.max_prio()
     }
 
-    /// How fast ``max_prio`` decays, applied once per ``update_prios`` call -- so its half-life
-    /// is measured in gradient steps, not environment steps. Settable, for a schedule that has to
-    /// track a changing replay ratio.
+    /// How fast ``max_prio`` decays, once per ``update_prios`` call, so its half-life is in
+    /// gradient steps. Settable.
     #[getter]
     fn max_prio_decay(&self) -> f32 {
         self.0.max_prio_decay()
@@ -323,35 +281,24 @@ impl PyReplayBuffer {
         Ok(self.0.set_max_prio_decay(max_prio_decay)?)
     }
 
-    /// Seed every environment with its initial observation.
+    /// Seed every environment with its initial observation, ``(num_envs, *obs_shape)`` or
+    /// ``(num_envs, obs_stack, *obs_shape)``, in the buffer's dtype. Called mid-run it abandons the
+    /// current episode, at the cost of at most one slot.
     ///
-    /// ``obs`` is indexed by environment: ``(num_envs, *obs_shape)``, or
-    /// ``(num_envs, obs_stack, *obs_shape)`` where the buffer has a frame stack, of which only
-    /// the newest frame is kept. It must already be the buffer's dtype; nothing is cast.
-    ///
-    /// Normally called once, before the first ``save_step`` -- autoreset boundaries during play
-    /// are inferred from the ``terminated`` and ``truncated`` flags, not from further ``reset``
-    /// calls. Calling it again mid-run means what ``gym.Env.reset`` means: abandon the current
-    /// episode and start a new one, which costs at most one slot.
-    ///
-    /// Raises TypeError on a dtype mismatch and ValueError on a shape mismatch, in both cases
-    /// before anything is written.
+    /// Raises TypeError on a dtype mismatch and ValueError on a shape mismatch, before anything is
+    /// written.
     fn reset(&mut self, obs: &Bound<'_, PyAny>) -> PyResult<()> {
         let obs = DynPyArrayLike::extract("obs", self.0.obs_dtype(), obs)?;
 
         Ok(self.0.reset(obs.as_array())?)
     }
 
-    /// Record one transition per environment and advance each write head.
+    /// Record one transition per environment and advance each write head. ``next_obs`` takes the
+    /// shapes ``reset``'s ``obs`` does. Under ``AutoresetMode.NEXT_STEP`` the call after an episode
+    /// ends completes no transition.
     ///
-    /// Every argument is indexed by environment, and ``next_obs`` takes the same two shapes
-    /// ``obs`` does in ``reset``. Under Gymnasium's default ``AutoresetMode.NEXT_STEP`` the step
-    /// that ends an episode carries that episode's final observation, and the call after it
-    /// carries the new episode's first observation with an action and reward the environment
-    /// ignored -- that call completes no transition and does not grow ``len(self)``.
-    ///
-    /// Raises TypeError on a dtype mismatch and ValueError on a shape mismatch, in both cases
-    /// before anything is written.
+    /// Raises TypeError on a dtype mismatch and ValueError on a shape mismatch, before anything is
+    /// written.
     fn save_step(
         &mut self,
         actions: &Bound<'_, PyAny>,
@@ -375,18 +322,13 @@ impl PyReplayBuffer {
     /// Draw ``batch_size`` transitions as
     /// ``(indices, prios, obs, actions, rewards, terminals, next_obs)``.
     ///
-    /// ``indices`` are flat ``env * env_capacity + slot`` indices, to hand back to
-    /// ``update_prios``. ``prios`` holds each drawn transition's stored priority, raw rather than
-    /// normalised so the caller picks its own denominator -- ``sum_prios`` for the sampling
-    /// probability, ``max_prio`` for a buffer-wide scale -- and is 1.0 throughout for a buffer
-    /// sampling uniformly.
+    /// ``indices`` go back to ``update_prios``. ``prios`` are the stored priorities, unnormalised,
+    /// and 1.0 throughout without priorities. ``rewards`` is the ``n_steps`` return and
+    /// ``next_obs`` the observation ``n_steps`` later; ``terminals`` marks true episode ends only.
     ///
-    /// ``rewards`` is the accumulated ``n_steps`` return and ``next_obs`` the observation
-    /// ``n_steps`` later. ``terminals`` marks true episode ends only: a transition cut short by a
-    /// time limit should still be bootstrapped from, so it is not marked here.
-    ///
-    /// Raises ValueError if no environment holds enough transitions yet, or if ``n_steps`` is
-    /// greater than one without a ``discount``.
+    /// Raises ValueError if ``discount`` is missing or out of range, ``batch_size`` is zero, or
+    /// nothing can be drawn yet, and RuntimeError if the priorities have collapsed onto slots that
+    /// cannot be drawn.
     #[pyo3(signature = (
         batch_size,
         *,
@@ -404,10 +346,7 @@ impl PyReplayBuffer {
             .with_n_steps(n_steps)
             .with_discount(discount);
 
-        // The draw walks the buffer and memcpys a whole batch of stacked observations out of it,
-        // touching no Python object on the way. That is by far the most time this extension spends
-        // in one call, and the loop calling it has a device transfer in flight, so it runs with
-        // the GIL released. Only the NumPy arrays below are built back under it.
+        // The draw touches no Python object, and the caller may have a device transfer in flight.
         let batch = py.detach(|| self.0.sample(batch_size, &params))?;
 
         Ok((
@@ -421,18 +360,12 @@ impl PyReplayBuffer {
         ))
     }
 
-    /// Replace the priorities at ``indices`` with ``prios``.
+    /// Replace the priorities at ``indices`` with ``prios``, which must be finite and
+    /// non-negative; the last value for a duplicate index wins. No exponent is applied. Also
+    /// refreshes ``max_prio``.
     ///
-    /// Both arrays must be the same length, and every priority must be finite and non-negative.
-    /// Duplicate indices are applied in order, so the last value for an index wins. No exponent
-    /// is applied here: a caller wanting the usual ``p ** alpha`` weighting applies ``alpha``
-    /// before calling, since the tree samples in proportion to whatever it stores.
-    ///
-    /// This also refreshes ``max_prio`` -- the priority newly written transitions are given -- as
-    /// the larger of the highest priority in ``prios`` and the previous value decayed by
-    /// ``max_prio_decay``.
-    ///
-    /// Raises ValueError if this buffer was built without priorities.
+    /// Raises ValueError without priorities or on an invalid priority, and IndexError on an index
+    /// out of range.
     fn update_prios(
         &mut self,
         indices: PyArrayLike1<u32>,
@@ -443,8 +376,7 @@ impl PyReplayBuffer {
             .update_prios(&indices.as_array(), &prios.as_array())?)
     }
 
-    /// Sum of every stored priority: the constant that turns ``sample``'s priorities into
-    /// sampling probabilities.
+    /// Sum of every stored priority, which turns ``sample``'s priorities into probabilities.
     ///
     /// Raises ValueError if this buffer was built without priorities.
     #[getter]

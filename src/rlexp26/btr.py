@@ -2,7 +2,7 @@ import math
 from collections import deque
 from collections.abc import Callable, Mapping
 from fractions import Fraction
-from typing import Any, override
+from typing import Any, NamedTuple, override
 
 import jax
 import jax.numpy as jnp
@@ -30,31 +30,21 @@ from .utils import (
 )
 
 # Hyperparameters
-# Gradient steps per environment step, counted over every environment at once: at the run's 64
-# environments 1/64 is one gradient step per loop iteration, which is BTR's rr = 1 -- their
-# replay period is their environment count, so their ratio is this one times the environments.
-# A Fraction rather than a float because learn_step spends it: the whole steps it owes come due
-# and the remainder is carried, and only exact arithmetic keeps a ratio like 1/3 from drifting
-# over a run's millions of iterations.
+# Gradient steps per environment step, over all environments at once: 1/64 at 64 environments is
+# one gradient step an iteration, BTR's rr = 1. A Fraction so the remainder learn_step carries
+# stays exact.
 REPLAY_RATIO = Fraction(1, 64)
 BATCH_SIZE = 256
-BUFFER_SIZE = 1 << 20  # 2 MebiTrans
+BUFFER_SIZE = 1 << 20
 TRAIN_START_BUF_SIZE = 200_000
 
 PER_ALPHA = 0.2
-# At 1.0 this cancels PER_ALPHA exactly -- sampling frequency times IS weight goes as
-# p ** (PER_ALPHA * (1 - PER_BETA)) -- and prioritisation reaches only which transitions arrive
-# together. At BTR's 0.2 the exponent is 0.16 and it reaches their expected contribution too,
-# worth +50 mean evaluation score per matched 2M-env-step window (17 of 21 windows) over the
-# pair of full runs in the provenance note. It is why train/grad_norm's median is 4.4 rather
-# than 2.7, and why the batch exceeds GRADIENT_CLIPPING_MAX_NORM on 8.7% of steps rather than
-# 0.9%; BTR clips at the same 10 with the same effective beta.
+# Sampling frequency times IS weight goes as p ** (PER_ALPHA * (1 - PER_BETA)), so at 1.0
+# prioritisation drops out of the expected gradient.
 PER_BETA = 0.2
 PER_EPSILON = 1e-6
-# Batches whose priorities may be in flight past the ones an iteration dispatches for itself,
-# which is the depth left over once a burst has filled the queue with its own steps and so the
-# part that a rising REPLAY_RATIO does not eat. ``init`` sizes the queue from it and the
-# environment count; at one gradient step an iteration that is a queue of three. See BTR.observe.
+# Batches whose priorities may stay in flight beyond the ones an iteration dispatches itself; see
+# BTR.init and BTR.observe.
 PRIO_QUEUE_SLACK = 2
 
 LEARNING_RATE = 1e-4
@@ -68,48 +58,32 @@ N_STEP = 3
 IQN_TRAIN_SAMPLES = 8
 IQN_ACT_SAMPLES = 32  # BTR: 8
 IQN_NUM_COS = 64
-# The Huber knee, in units of the TD error. Inside it the pinball-weighted loss is an asymmetric
-# *square*, whose minimiser is the tau-expectile, not the tau-quantile; outside it the loss is
-# the pinball loss proper and the minimiser is the quantile. So this constant chooses which
-# statistic the network fits, and at 1.0 against a raw |td| that spans 0.02-0.45 over a run it
-# chooses the expectile nearly always. QR-DQN's footnote says where the 1.0 came from: DQN
-# clipped the squared error to [-1, 1], which is identically a Huber with kappa = 1, and the
-# value has been inherited ever since. It is tied to reward clipping's [-1, 1], not to anything
-# about the scale of Q.
+# The Huber knee, in units of TD error. Below it the pinball-weighted loss is minimised by the
+# tau-expectile, above it by the tau-quantile, so this picks which statistic the head fits.
 IQN_HUBER_LOSS_K = 1.0
-# Applied before Adam, so it is the gradient Adam's moments see. That ordering is the reason to
-# keep it: a spike admitted into nu is held for 1/(1 - ADAM_B2) = 1000 steps while mu forgets it
-# in ten, which suppresses every legitimate update in between. Engaged on 8.7% of steps over the
-# last full run, so it is part of the update rule here rather than a rare guard.
+# Applied before Adam, so it bounds what reaches Adam's moments.
 GRADIENT_CLIPPING_MAX_NORM = 10
 
 INFERENCE_SYNC_FREQ = 3
 TARGET_NETWORK_UPDATE_FREQ = 500
 LAYER_NORM = False
 IMPALA_SIZE_FACTOR = 2
-# The trunk's convolutions compute in this and nothing else does; ImpalaCNNLarge says what that
-# means for the parameters. Worth 1237 -> 2152 env steps/s, the largest single win the profiling
-# found, and it costs nothing measurable in score or in the diagnostics over a full budget --
-# see the precision block below. float16 measures the same and is not used, since the residual
-# stream has no loss scaling behind it and bfloat16 is the one that keeps float32's exponent
-# range.
-# Spelled as a string so that ``hyperparameters`` below sweeps it up with the rest: a dtype
-# object is not one of the scalar types it keeps, and a run whose trunk precision were missing
-# from the HParams table could not be told from a float32 one afterwards.
+# The trunk convolutions' compute dtype; see ImpalaCNNLarge. A string so that ``hyperparameters``
+# records it.
 IMPALA_DTYPE = "bfloat16"  # BTR: float32
 
 MUNCHAUSEN_TEMPERATURE = 0.03
 MUNCHAUSEN_SCALING_TERM = 0.9
 MUNCHAUSEN_CLIPPING_VAL = -1.0
 
-# Acting draws from the soft policy softmax(Q / tau) that Munchausen's target already assumes,
-# rather than BTR's argmax, so the behaviour policy is the one the loss is written around.
-# ACT_TEMPERATURE is an alias, not a coincidence: decouple it only to deliberately sharpen or
-# flatten exploration relative to the learning target.
-ACT_USE_SOFT_POLICY = True  # BTR: False (argmax + epsilon)
+# Act by sampling softmax(Q / ACT_TEMPERATURE) instead of the argmax. ACT_TEMPERATURE is read by
+# _act and train/regret only; the loss uses MUNCHAUSEN_TEMPERATURE. Munchausen's gap amplification
+# cancels its own (1 - alpha), so softmax(q / MUNCHAUSEN_TEMPERATURE) is already the soft-optimal
+# policy: dividing by (1 - alpha) * tau acts 10x sharper (docs/behaviour-policy.md).
+ACT_USE_SOFT_POLICY = True  # BTR: False
 ACT_TEMPERATURE = MUNCHAUSEN_TEMPERATURE
 
-# Off in favour of the softmax categorical sampling
+# Geometric decay, see epsilon_at, and off from EPS_GREEDY_OFF_FRAMES.
 EPS_GREEDY_START = 0.0  # BTR: 1.0
 EPS_GREEDY_END = 0.0  # BTR: 0.01
 EPS_GREEDY_DECAY_FRAMES = 8000_000
@@ -117,285 +91,76 @@ EPS_GREEDY_OFF_FRAMES = 100_000_000
 EVAL_EPS_GREEDY = 0.0  # BTR: 0.01
 EVAL_EPS_GREEDY_OFF_FRAMES = 125_000_000
 
-# Gradient steps between writes, per group. What _train_step returns -- train/* and plasticity/*
-# -- is eleven series over arrays the step already holds, so only its transfer is worth thinning.
-# The per-parameter scales are ~130 series that move over a whole run and say nothing new at a
-# fine cadence, and learn_step computes them on this cadence rather than every step. At these
-# numbers a 200M-frame run writes ~15 MB where one logging everything at 25 wrote 384.
+# Gradient steps between writes: _train_step's scalars are transferred at TRAIN_LOG_FREQ, and
+# _scale_stats runs at SCALE_LOG_FREQ.
 TRAIN_LOG_FREQ = 100
 SCALE_LOG_FREQ = 2500
 
 # Every constant above, and the architecture below, checked against BTR (arXiv:2411.03820,
-# Table D6 and Appendices E/H) and its reference implementation (github.com/VIPTankz/BTR)
-# on 2026-09-12. All of it matches bar what is explicitly marked otherwise. Table D6 gives PER
-# an alpha and nothing else, so PER_BETA and PER_EPSILON come from PER.py in the reference
-# implementation: its eps is 1e-6, and its effective beta is 0.2 because its IS weights are
-# ``(capacity * prob) ** -self.alpha``, with alpha standing where beta belongs -- the comment
-# beside that line calls it an accident kept for performing better. ``self.beta`` itself is
-# vestigial: initialised to 0.4, reset to 0 by every insert, and read by no live code.
-#
-# Scores checked against BTR's own results.csv (200 Breakout evaluations, 100 episodes each),
-# from the 212M-frame run in logs/breakout_2026-09-13_14-12-41: 557 against their 549 past 40M
-# frames, and 584 against their 601 over the closing evaluations. What remains of the shortfall
-# is all before 40M frames -- 253 against 383 -- where this run is about 5M frames later than
-# BTR in taking off and then converges onto its curve by 15M. PER_BETA is not what that is; see
-# the evaluation-protocol entry in the backlog for what is.
+# Table D6 and Appendices E/H) and its reference implementation (github.com/VIPTankz/BTR) on
+# 2026-09-12; everything matches bar what is marked. Table D6 gives PER only an alpha, so
+# PER_BETA and PER_EPSILON come from the reference's PER.py: its eps is 1e-6, and its IS weights
+# are ``(capacity * prob) ** -self.alpha`` -- alpha where beta belongs, so an effective beta of
+# 0.2. docs/reproduction.md has the score comparison.
 
 # +--------------+
 # | AI Generated |
 # +--------------+
 
 # === Correctness to settle ===
-# TODO: NoisyNets' sigma is drifting rather than being learned, and a remedy has to be picked.
-#       Over two full runs, and unmoved by PER_BETA, every NoisyLinear's noisy_sigma_neg_frac
-#       leaves 0 for 0.37-0.48 and its noisy_sigma_signed collapses to zero, while every sigma
-#       tensor's adam_snr sits below the 0.18 iid-gradient floor and its adam_step_rel *rises*
-#       -- x3 on value_linear1/kernel_sigma, since sigma's RMS shrinks underneath it.
-#       noisy_sigma_ratio ends at 0.024 and 0.071 on the two output layers, so whatever the head
-#       is exploring with by then, it is not this. Both candidates are optimiser-side: weight
-#       decay on the sigma parameters, or BTR's one draw per gradient step in place of
-#       NoisyLinear's per-__call__ redraw, which is what has the three forward passes in a
-#       train_step disagreeing about eps and is the reason this run is more exposed than BTR is.
-#       The schedule is not the problem.
+# TODO: NoisyNets' sigma drifts rather than being learned (docs/plasticity.md). Candidates:
+#       weight decay on the sigma parameters, or BTR's one noise draw per gradient step in
+#       place of NoisyLinear's per-call redraw.
 
 # === Missing core pieces ===
-# Logging and checkpointing are both done: train_step's scalars, the run rates, and the
-# background evaluation's unclipped score all reach TensorBoard, and --resume picks up the
-# newest step-numbered checkpoint with qnet, target_qnet, the optimizer, rngs, the counters and
-# the buffer's max_prio. Dormancy, dead units and effective rank are in utils.feature_scales,
-# fed by the trunk activations QNet.__call__ sows and train_step captures.
-# TODO: decide whether resuming onto an empty replay buffer is acceptable. The buffer is the
-#       one thing a checkpoint does not carry (tens of gigabytes), so the first
-#       TRAIN_START_BUF_SIZE transitions after a resume are collected with no learning at all,
-#       and the buffer then holds nothing but data from a policy that is already trained.
+# TODO: decide whether resuming onto an empty replay buffer is acceptable. A checkpoint does not
+#       carry the buffer, so a resumed run collects TRAIN_START_BUF_SIZE transitions without
+#       learning, all of them from an already-trained policy.
 
 # === Performance ===
-# Measured 2026-09-13, 3080 + 24-thread host, 64 envs, batch 256, 1:1 act/train, steady state,
-# each step of the chain over two or three runs:
-#   1034 env steps/s   where the profiling started
-#   1112              --xla_gpu_force_conv_nhwc, since removed: see IMPALA_DTYPE
-#   1237-1261         the priority write-back queued, PRIO_QUEUE_SLACK
-#   2152-2153         the trunk's convolutions in bfloat16, IMPALA_DTYPE
-# That is 61.9 -> 29.7 ms an iteration, ~8.6k ALE frames/s, ~6.5h for 50M env steps / 200M frames.
-# Held over a full run: 2089 env steps/s median across 6.9 h and 824k gradient steps, flat from
-# the first decile to the last. The per-parameter scales moving to SCALE_LOG_FREQ is worth the
-# last 5.9% of that -- they used to be reductions inside every gradient step -- and it also
-# lifts the slow tail, p5 1906 against 1694 over windows of equal length. Compare rates only at
-# equal LOG_FREQ: the window is the averaging interval, so a longer one hides brief dips.
-#
-# From a jax.profiler trace of gradient steps 20..80 (`--profile 20:60`), per iteration. The
-# kernel durations are the device's own and stand as they are; every host span carries CUPTI's
-# per-launch cost, which is now most of what the trace measures -- it reports a 54.6 ms iteration
-# against the 29.7 the rate scalar sees -- so read a host span as its share of 54.6, never
-# against the real wall:
-#   device kernels  23.0 ms   1153 launches an iteration, median 1.3 us -- 77% of the real 29.7
-#   learn_step      41.6 ms   host, of 54.6; almost all of it inside the executable call
-#   env.step         2.9 ms   host, ALE; it launches nothing, so the inflation misses it
-#   observe          0.3 ms   host: 0.22 ms of it in the buffer's save_step, 0.04 in update_prios
-#   act transfer     0.1 ms   host; the overlap works, this one is free
-#
-# Re-measured 2026-09-18 on the same host with LAYER_NORM on, evaluation and checkpointing off,
-# by perf/bench_loop.py: 2253 env steps/s an iteration of 28.4 ms. Each part timed alone, device
-# under saturation and host after a barrier, so the two columns are what each really costs:
-#   _train_step        25-26 ms device, 12-16 ms host
-#   _act, 64 envs       0.9 ms device,  3.9 ms host
-#   sync_qnet             0 device,     6.7 ms host, before it stopped being jitted
-#   buf.sample                          1.0-2.0 ms host, flat in how full the buffer is
-#   the batch's h2d                     1.2 ms host, obs and next_obs together
-#   env.step, 64 envs                   1.6 ms host
-#   save_step                           0.07 ms host; update_prios 0.006
-# The device is 26.2 ms of the 28.4 and the host, at ~22, has slack -- so every host saving
-# below measured zero on the wall, and only device work is worth cutting. _train_step's device
-# time is its trunk passes and nothing else: 4.4 ms for the Munchausen pass over obs, 4.4 for
-# the target on next_obs, 16.7 for the online forward and backward, summing to the whole within
-# 0.5%. The trunk holds ~30 TFLOP/s of bfloat16, about half of what this card does dense, so
-# there is no large kernel-level win left under it either.
-#
-# That first pass has since gone -- loss_fn reads the Munchausen log-policy off the online one
-# -- so the table above is a three-pass gradient step. The same harness on Zaxxon, the two back
-# to back, 280 s each: 2304 -> 2614 env steps/s, +13.5%, 27.8 -> 24.5 ms an iteration, with the
-# slower run's p90 below the faster run's p10.
-#
-# The loop is still device-bound after that, but the margin narrowed enough that the host is
-# worth cutting too. By perf/split_train_step.py, three runs each, and a BENCH_RR=0/64 run for
-# the host cost left when no gradient step is taken at all:
-#   _train_step         22.0 ms device (21.8-22.8), against 26.4 with the third pass (26.4-26.5)
-#                       14.1 ms host to dispatch, 7.0 with its modules bound
-#   _act, 64 envs        1.8 ms device, 1.7 ms host, bound
-#   loop, no grad step  12154 env steps/s, 5.3 ms an iteration -- env.step, save_step and _act
-# So ~14 ms of host against ~24 of device in a 24.5 ms iteration, and the GPU sets the rate.
-#
-# Binding _train_step's modules (see __init__) is that 14.1 -> 7.0, and what is left is still
-# nnx's: nnx.split of the four alone is 5.1 ms for 297 array leaves, against a 1.1 ms jax.jit
-# dispatch floor for the same arrays -- which is what a pure-JAX kernel over a state pytree
-# would cost, and the only way to get the remaining 6. The binding buys no wall time, exactly as
-# the entry it replaces predicted: 2633 env steps/s against 2457 in one pair, with an earlier
-# run of the same unbound code at 2614, so run-to-run drift swamps it. It is taken for the CPU,
-# which is real and is not free elsewhere on the machine: 3.77 cores against 3.87 over an equal
-# wall, 92 against 101 ms of CPU a gradient step.
-#
-# Gradient steps an iteration against env steps/s, everything else held (perf/sweep.sh):
-#   1 -> 2253     2 -> 1150     4 -> 602     8 -> 294
-# Linear to within 5%, and that 5% is the per-iteration cost amortising rather than slack being
-# taken up: a gradient step costs its own 25 ms of device wherever it lands. A 200M-frame budget
-# is 6.2 h at 1, 12.1 at 2, 23.1 at 4, 47.2 at 8.
-#
-# Evaluation runs nearly always: one 8-episode evaluation on Phoenix outlasted 6250 gradient
-# steps, so both EVAL_FREQ windows inside a 280 s run were skipped, and it is the episode's
-# length that does that -- binding _act below did not change it. What it *costs* the loop is
-# _act's host time, Python holding the GIL against the loop's own dispatch rather than the two
-# contending for the device, and binding the net took 60% of that back:
-#   2133 -> 2206 env steps/s with evaluation on   (Mann-Whitney p = 5e-10 over ~70 windows)
-#   2257 -> 2255 with it off                      (p = 0.72)
-# A 5.5% tax down to 2.2%, and nothing either way in the training loop itself -- which is the
-# whole shape of this block in one measurement: host savings show up only where a thread is
-# host-bound, and the loop is not.
-# Convolutions still carry the device, at ~18% of it, but no longer dominate it; what is left of
-# the idle is the launch-bound tail, 81% of launches under 5 us for 6% of device time. Shrinking
-# that means fewer kernels rather than faster ones, and nothing below has found a way to.
-#
-# Measured and rejected, so they do not get tried twice:
-#   XLA command buffers         no change, at any --xla_gpu_enable_command_buffer setting.
-#   TF32 matmul precision       JAX_DEFAULT_MATMUL_PRECISION moves dots, not cuDNN's convs,
-#                               which pick their own math type; no change either way.
-#   dropping the diagnostics    0.8 ms/step of 59, so utils' "costs nothing" claim holds.
-#   dropping SpectralNorm       2.0 ms/step of 59. Not where the time goes.
-#   a queue of 5 batches        1280 against 1237 and 1261 at a queue of 3, inside the
-#                               run-to-run spread, so PRIO_QUEUE_SLACK keeps the shallower queue
-#                               and its smaller stale window.
-#   --xla_gpu_force_conv_nhwc   worth 8% while the trunk was float32, nothing once it is
-#                               bfloat16: XLA already lays 16-bit convolutions out NHWC.
-# TODO: donate_argnums on the jitted steps to avoid param copies.
-# TODO: the head and the loss are still float32. They are ~1/6 of the trunk's FLOPs, so this is
-#       worth far less than the trunk was, and the quantile axes make the loss the part of the
-#       graph where precision is least obviously free. Measure before assuming it is.
-
-# === Precision ===
-# IMPALA_DTYPE is settled over a full budget. Two runs matched step for step --
-# logs/breakout_2026-09-12_02-33-13 in float32 to 951,987 gradient steps and
-# logs/breakout_2026-09-13_04-18-22 in bfloat16 to 857,335 -- put bfloat16 at 513 +/- 74 mean
-# evaluation score over the 10M-55M env step overlap against float32's 480 +/- 68 (Welch
-# p = 0.002; one seed each, so this reads as no worse rather than better), at 2020 against 1063
-# env steps/s. spectral_sigma and noisy_sigma agree between the two to better than 3% at 52M env
-# steps, and dormant_frac and dead_frac stay at zero in both.
-# Per batch, against an identical float32 net: the trunk's features carry 0.7% relative L2 error
-# and its weight gradients 0.9% median, both a small multiple of bfloat16's own 0.39% rounding
-# unit. Nothing compounds by construction either -- the parameters and Adam's moments are
-# float32, so no rounding accumulates in the weights, and bfloat16 keeps float32's exponent range
-# so nothing underflows.
+# TODO: donate_argnums on the jitted steps to avoid param copies, leaving out the nets
+#       sync_qnet aliases.
+# TODO: the head and the loss are still float32. They are ~1/6 of the trunk's FLOPs, and the
+#       quantile axes make the loss where precision is least obviously free. Measure first.
 
 # === Reproduction / tuning ===
-# TODO: evaluation is not scored the way BTR scores it, and the two deviations both push the
-#       early curve down. Evaluator plays the training policy with NoisyLinear drawing live,
-#       where BTR's prep_evaluation deep-copies the net and zeroes weight_epsilon/bias_epsilon,
-#       so it scores the mean weights; and EVAL_NUM_ENVS gives 8 episodes against their 100,
-#       which puts +/-26 on each point when the eval-to-eval sd is 73. The first of those is
-#       worth the most early, exactly where the remaining shortfall is: noisy_sigma_ratio opens
-#       near 1.0, so the scored policy is at its noisiest while BTR's is deterministic, and the
-#       curves converge as the ratio falls to 0.02-0.37. Settle it by scoring one checkpoint
-#       both ways before reading anything more into the early frames.
-# TODO: EPS_GREEDY_START/END are 0.0 where BTR anneals 1.0 -> 0.01 over 2M env steps and holds a
-#       floor until half the budget. The deviation is deliberate and marked, but it is the other
-#       candidate for the early gap and is untested.
-# TODO: the action gap this run trains to is ~26x below BTR's, and since ACT_TEMPERATURE is
-#       calibrated against nothing else, both the soft draw and any argument about it rest on a
-#       number never measured here. Theorem 2 of Munchausen (arXiv:2007.14430) puts M-VI's
-#       converged gap at (1 + alpha) / (1 - alpha) = 19x that of the MDP its entropy coefficient
-#       (1 - alpha) * tau regularises -- a property of the task and the state, so BTR and this
-#       run, sharing Phoenix and both constants, are predicted the same gap. They do not have
-#       it: BTR measures 0.282, or 9.4 tau, where softmax(q / tau) is an argmax to three digits,
-#       and this run's policy_entropy and run/action_log_prob imply ~0.011, or 0.4 tau,
-#       shrinking over a run rather than growing. Neither side of the theorem is observable
-#       here, so the 26x is approximation error or a difference in which states get visited, and
-#       one candidate for the first is that the alpha * tau * log pi(a|s) bonus separates actions
-#       only to the extent log pi is spread across them: a flat policy and a flat gap hold each
-#       other in place, and acting from that same flat policy is what this run adds to BTR.
-#       Measure the gap directly before touching ACT_TEMPERATURE or ACT_USE_SOFT_POLICY: mean
-#       top-two |advantage| over a few thousand states with the NoisyNet draw zeroed, which is
-#       the quantity BTR's 0.282 is. Score the same checkpoint under soft tau, argmax, and
-#       argmax + eps = 0.01 while it is loaded and the evaluation entry above is settled with it.
-#       (1 - alpha) * tau is not the alternative it looks like -- it is the coefficient of the
-#       *unamplified* reference MDP, so dividing this q by it double-counts Theorem 2's factor.
+# TODO: train/regret reads 0 for a greedy run, since the NoisyNet draw's own cost needs a
+#       reference pass with the noise zeroed. Only the head carries noise, so only the head
+#       would re-run.
 
 # === Experimental / longer term ===
-# TODO: LayerNorm, per BTR's Appendix H, which says where to put it and reports a clear gain.
-#       Highest-value experiment on this list. Does LN make SN redundant? Try LN-only, SN-only,
-#       both. XQC rates LN the worst of its three normalisers, but it is comparing LN against BN
-#       in a continuous-control critic, not against nothing in an Atari trunk, and Appendix H's
-#       gain is measured on this benchmark -- so LN stays ahead of BN below in the queue.
-# TODO: plasticity. Two full runs have now been read and the pathology is neither dormancy nor
-#       rank: dead_frac is zero throughout, dormant_frac is non-zero only before 0.31M env
-#       steps, and effective_rank turns out to be bounded by the batch rather than the trunk --
-#       see utils.feature_scales for the reference points, which put a *trained* trunk above a
-#       fresh one on the same observations. What is unbounded is scale, and it is the
-#       denominator of the effective learning rate that eats it: weights/global_norm goes
-#       61 -> 162 and is still linear at the end, value_linear1/kernel_mean's RMS goes x11 and
-#       quantile_embedding/linear/bias x89, while adam_snr is flat, so the output layers'
-#       adam_step_rel falls x6 (3.1e-4 -> 4.6e-5) with no change in the gradient at all. That is
-#       the ELR collapse Lyle et al. and XQC (arXiv, ICLR 2026 submission) describe, and weight
-#       decay below is the half of it this run can act on. Resets address what none of this
-#       shows; for scale, a 50M-step run is ~824k updates, ~21 at BBF's 40k cadence.
-# TODO: weight decay, as the cheap half of the above, and now unblocked -- the PER_BETA
-#       comparison it was waiting on is done. WEIGHT_DECAY is wired and sits at 0.0; the comment
-#       on it says what to turn it on at and why that is not the value BTR's AdamW null result
-#       covers. XQC's own answer to the same growth is to project every dense weight to the unit
-#       sphere each step, which is strictly better at holding ||theta|| fixed but is only legal
-#       because its BN layers make the network scale-invariant; nothing here is, so decay is the
-#       available version.
-# TODO: IQN_HUBER_LOSS_K, which decides whether the head fits quantiles or expectiles -- see the
-#       constant. Two things follow from being in the quadratic branch nearly always. The
-#       estimand is wrong: IQN reads Q as the mean over uniform tau of the learned statistics,
-#       which is E[Z] for quantiles by construction and is not for expectiles, and on a
-#       return-shaped skewed distribution the kappa = 1 fit comes out biased *upward* -- the
-#       direction a max-over-actions bootstrap compounds -- where kappa = 0.1 does not. And the
-#       estimand drifts, because kappa is an absolute threshold against a raw |td| that moves
-#       18.5x over a run and a Q that moves 200x, so the statistic being fitted is not the same
-#       one at 1M steps as at 800k. Sweep kappa in {1, 0.3, 0.1}; the scale-free version is to
-#       set the knee from the batch's own |td| rather than from a constant, which is the fix the
-#       drift argues for and is a deviation from BTR either way.
-#       kappa = 0 is the pinball loss proper and is a real configuration, not a failure mode:
-#       QR-DQN reports it as QR-DQN-0 at 199% median / 881% mean human-normalised against
-#       QR-DQN-1's 211% / 915% over 57 games. It costs ~6% and it is what the unbiased estimand
-#       actually requires. Two things to expect from it: mean |dl/dprediction| at the optimum
-#       rises x1.89 against kappa = 1, which at a median grad_norm of 4.4 puts most steps into
-#       GRADIENT_CLIPPING_MAX_NORM; and the gradient no longer shrinks as the prediction
-#       approaches the target, which is one of the two candidate mechanisms for the sub-floor
-#       adam_snr in the plasticity entry above, so read that diagnostic after changing this.
-#       The loss already reaches the huber_k = 0 limit, so the sweep is one constant.
-# TODO: GRADIENT_CLIPPING_MAX_NORM is a fixed absolute bound with the same scale problem as the
-#       Huber knee, and Adam already bounds each coordinate's step to ~lr regardless of gradient
-#       size, so the clip looks redundant. It is not, for one reason: it sits before Adam, and
-#       what it protects is nu. Removing it is still worth measuring, because the alternative
-#       reading of 8.7% engagement is that the clip is what is keeping adam_snr where it is.
-#       Measure it as an ablation with adam_snr and adam_step_rel read beside the score, not as
-#       a cleanup.
-# TODO: XQC's three components, as the next place to look after LayerNorm, and in this order.
-#       (1) BN in place of LN: XQC's Hessian eigenspectra put BN an order of magnitude below LN
-#       on condition number, which is the opposite of this field's usual default. It does not
-#       port cheaply -- their BN needs CrossQ's joined forward pass over (s,a) and (s',a') to
-#       keep its running statistics honest, and that trick exists because CrossQ has no target
-#       network, where this has one at 500-step staleness. (2) The categorical CE loss. Half of
-#       XQC's case for it does not apply here: their contrast is against an MSE with unbounded
-#       dL/dy_hat, and the quantile Huber already bounds it by pinball_weight * huber_k <= 1.
-#       What is left is the Hessian structure, and the cost is replacing IQN with C51 outright.
-# TODO: resets, at a higher replay ratio. What the ratio costs is settled -- the performance
-#       block has it, and it is linear -- so the open half is what it buys, and on a 3080 the
-#       budget is what decides: 12 h a run at two gradient steps an iteration, 23 at four.
-#       BBF's 40k cadence is ~21 resets over a 50M-step run.
-# TODO: exploration beyond NoisyNets -- only after a clean baseline reproduces, and neither
-#       candidate is a patch on this loop: NGU needs an R2D2 backbone and BYOL-Explore an RNN
-#       world model. Only NGU's episodic bonus is extractable on its own.
-# TODO: sanity-check the whole stack on LunarLander (discrete) first; Atari runs
-#       are too slow a feedback loop for debugging.
-# TODO: consider a tiny env + tiny net regression test that runs in seconds, so
-#       late-night edits get caught by something other than the next reading.
+# TODO: LayerNorm per BTR's Appendix H. Does it make SpectralNorm redundant? Try LN-only,
+#       SN-only, both.
+# TODO: plasticity. The pathology is growing scale collapsing the effective learning rate, not
+#       dormancy or rank (docs/plasticity.md). Weight decay and projection below act on it;
+#       resets address what none of the diagnostics show.
+# TODO: weight decay (WEIGHT_DECAY, wired at 0.0), or XQC's per-step projection of each weight
+#       onto the unit sphere. Projection is legal everywhere but value_linear1 and
+#       advantage_linear1, which carry the return's scale (docs/plasticity.md). Decaying
+#       quantile_embedding annealed IQN's tau modulation in the LN + WD run.
+# TODO: IQN_HUBER_LOSS_K. At 1.0 the head fits expectiles, biased upward on a skewed return, and
+#       the fitted statistic drifts as |td| moves over a run (docs/plasticity.md). Sweep
+#       {1, 0.3, 0.1, 0}, or set the knee from the batch's own |td|. kappa = 0 is QR-DQN-0;
+#       expect more clipping, and read adam_snr after changing it.
+# TODO: ablate GRADIENT_CLIPPING_MAX_NORM, reading adam_snr and adam_step_rel beside the score:
+#       the clip engages often enough that it may be what holds adam_snr where it is.
+# TODO: XQC's components after LayerNorm, in order. (1) BatchRenorm in place of LN, without
+#       CrossQ's joined forward pass, which buys nothing here (docs/plasticity.md). (2) The
+#       categorical CE loss, which means replacing IQN with C51; the quantile Huber already
+#       bounds dL/dy_hat, so only XQC's Hessian argument carries over.
+# TODO: resets, at a higher replay ratio, whose cost is linear (docs/performance.md). BBF's 40k
+#       cadence is ~21 resets over a 50M-step run.
+# TODO: exploration beyond NoisyNets, once a clean baseline reproduces. NGU needs an R2D2
+#       backbone and BYOL-Explore an RNN world model; only NGU's episodic bonus stands alone.
+# TODO: sanity-check the whole stack on LunarLander (discrete) first; Atari runs are too slow a
+#       feedback loop for debugging.
+# TODO: a tiny env + tiny net regression test that runs in seconds.
 
 
 def create_rngs(seed: int) -> nnx.Rngs:
     """
-    One RNG stream per concern: ``nnx.Rngs(seed)`` would put them all on one counter, where
-    drawing one more quantile per step shifts the NoisyNet noise for the rest of the run. No
-    ``default``, so an unnamed stream raises instead of quietly aliasing the others.
+    One RNG stream per concern, so that drawing more from one does not shift the others. No
+    ``default``, so an unnamed stream raises instead of aliasing one of these.
     """
     return nnx.Rngs(
         params=seed, noise=seed + 1000, samples=seed + 2000, explore=seed + 3000
@@ -425,10 +190,8 @@ class QNet(nnx.Module):
         self.quantile_embedding = IQNCosineEmbedding(
             self.decoder.out_features, num_cosines=IQN_NUM_COS, rngs=rngs
         )
-        # Each stream is normalised on the way into its hidden activation and nowhere else:
-        # the layer after it has to carry the scale of a return, so normalising there would
-        # take away the one job it has. ``epsilon`` is Flax's default here as in the trunk --
-        # see ImpalaBlock for what that is worth against torch's.
+        # Normalised before the hidden activation only: the output layer carries the return's
+        # scale.
         self.value_linear0 = NoisyLinear(self.decoder.out_features, 512, rngs=rngs)
         self.value_layer_norm0: nnx.LayerNorm | None = nnx.data(None)
         if layer_norm:
@@ -494,13 +257,14 @@ def norm_obs(obs: ArrayLike) -> jax.Array:
 
 def epsilon_at(num_frames: int) -> float:
     """
-    Training epsilon after ``num_frames`` ALE frames. Linear rather than exponential, which is
-    what BTR's "start / decay / end" triple means.
+    Training epsilon after ``num_frames`` ALE frames: geometric decay onto EPS_GREEDY_END with
+    EPS_GREEDY_DECAY_FRAMES as the 1/e time constant, the continuous limit of BTR's
+    ``EpsilonGreedy.update_eps``. Table D6's "Decay: 8M Frames" is not an anneal length.
     """
     if num_frames >= EPS_GREEDY_OFF_FRAMES:
         return 0.0
-    decayed = min(num_frames / EPS_GREEDY_DECAY_FRAMES, 1.0)
-    return EPS_GREEDY_START + decayed * (EPS_GREEDY_END - EPS_GREEDY_START)
+    decayed = math.exp(-num_frames / EPS_GREEDY_DECAY_FRAMES)
+    return EPS_GREEDY_END + decayed * (EPS_GREEDY_START - EPS_GREEDY_END)
 
 
 # num_samples sizes the quantile draw, so it has to be static.
@@ -516,36 +280,17 @@ def _act(
     temperature: float = ACT_TEMPERATURE,
 ) -> tuple[jax.Array, jax.Array]:
     """
-    One action per environment -- drawn from ``softmax(Q / temperature)`` under
-    ACT_USE_SOFT_POLICY, the argmax without it -- with NoisyNets and an optional epsilon-greedy
-    override alongside, and that action's log-probability under the behaviour policy the
-    override defines.
+    One action per environment -- sampled from ``softmax(Q / temperature)`` if ``soft_sampling``,
+    the argmax otherwise -- under NoisyNets and an epsilon-greedy override, and the taken action's
+    log-probability under that behaviour policy.
 
-    That log-probability is conditional on this call's NoisyNet draw, so it is not the marginal
-    behaviour policy's: read it as ``E_xi[log pi_xi(a | s)]`` with ``a ~ pi_xi``, a conditional
-    entropy that understates how stochastic acting really is. Same caveat on train_step's
-    ``policy_entropy``. Both are therefore a floor on how stochastic the draw is, which is the
-    direction the paragraph below rests on.
-
-    Soft sampling is self-correcting where epsilon-greedy is merely immune: a frozen state pays 0
-    for every action forever, so Q(s, .) goes flat and the softmax goes uniform exactly where the
-    policy is stuck. The epsilon path is kept, per-env and independent of the weights, as the one
-    escape a confidently wrong Q cannot fool; turn it back on if a freeze recurs.
-
-    How sharp the draw comes out depends on the top-two action gap over ``temperature`` and on
-    nothing else. That gap is not the scale of Q and cannot be read off it: it is the difference
-    of two discounted sums sharing a 1 / (1 - DISCOUNT) = 333-step horizon, so it is a small
-    residual of a large common value, and the dueling head splits the two by construction. On
-    Phoenix the gap implied by ``run/action_log_prob`` and ``policy_entropy`` runs about 0.4
-    tau, putting p(chosen action) near 0.6 against the 0.125 of a uniform draw over its 8, and it
-    shrinks over a run rather than growing. BTR reports 0.282 for the same quantity on the same
-    game, which is 9.4 tau and would make this softmax an argmax to three digits. So the draw is
-    genuinely stochastic at this temperature and nothing in the loop holds it anywhere in
-    particular: read the two series above before assuming either limit.
+    The log-probability is conditional on this call's NoisyNet draw, so it understates how
+    stochastic acting is; so does train_step's ``policy_entropy``. Without soft sampling it
+    depends on nothing but epsilon and the action count.
     """
     obs = norm_obs(obs)
 
-    # It's okay to use advantages here because softmax is shift invariant.
+    # Advantages suffice: softmax and argmax are both shift invariant.
     advantages = qnet.random_n_samples_mean(
         obs, num_samples, advantage_only=True, rngs=rngs
     )
@@ -574,7 +319,7 @@ def _act(
     return actions, log_probs
 
 
-@nnx.jit(static_argnames=("num_samples",))
+@nnx.jit(static_argnames=("num_samples", "soft_sampling"))
 def _train_step(
     qnet: QNet,
     target_qnet: QNet,
@@ -594,15 +339,14 @@ def _train_step(
     temperature: float = MUNCHAUSEN_TEMPERATURE,
     munchausen_scaling_term: float = MUNCHAUSEN_SCALING_TERM,
     munchausen_clipping_val: float = MUNCHAUSEN_CLIPPING_VAL,
+    soft_sampling: bool = ACT_USE_SOFT_POLICY,
+    act_temperature: float = ACT_TEMPERATURE,
+    epsilon: float = 0.0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """
-    One gradient step, returning the batch's new priorities and a dict of diagnostic scalars.
-    Both stay on the device for the caller to drain an iteration later; see ``__init__.main``.
-
-    The scalars here are the ones that need something the step holds and nothing else does -- the
-    batch, its gradient, the trunk activations of the online pass. The per-parameter scales are
-    read off the module and the optimizer instead, so ``BTR.learn_step`` takes those outside this
-    function and pays for them only on the steps that write them.
+    One gradient step, returning the batch's new priorities and its diagnostic scalars, both left
+    on the device. Only the scalars that need the batch, its gradient or the online pass's
+    activations are here; the per-parameter scales are ``_scale_stats``.
     """
     obs = norm_obs(obs)
     actions = jnp.expand_dims(actions, -1)
@@ -610,16 +354,25 @@ def _train_step(
     dones = jnp.expand_dims(dones, -1)
     next_obs = norm_obs(next_obs)
 
-    # The buffer hands back raw stored priorities, not p / sum_prios. That is fine here:
-    # normalising by the batch maximum cancels any constant factor, so neither sum_prios
-    # nor the buffer's length is needed. Keep this [batch], not [batch, 1] -- broadcasting
-    # it against transition_losses would silently reduce to mean(w) * mean(loss).
+    # Raw stored priorities: normalising by the batch maximum cancels the missing sum_prios.
+    # Keep this [batch], not [batch, 1], or the product with transition_losses silently becomes
+    # mean(w) * mean(loss).
     importance_sampling_weights = jnp.asarray(sample_prios) ** -PER_BETA
     importance_sampling_weights /= jnp.max(importance_sampling_weights)
 
+    class RawStats(NamedTuple):
+        td_error: jax.Array
+        q_quants: jax.Array
+        policy_entropy: jax.Array
+        action_gap: jax.Array
+        regret: jax.Array
+        gap_bar: jax.Array
+        sigma_rank: jax.Array
+        features: jax.Array
+
     def loss_fn(
         qnet: QNet, target_qnet: QNet, rngs: nnx.Rngs
-    ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
+    ) -> tuple[jax.Array, RawStats]:
         samples = rngs.samples.uniform((*obs.shape[:-3], num_samples))
         q_quants, outputs = nnx.capture(
             qnet, nnx.Intermediate, method_outputs=nnx.Intermediate
@@ -627,23 +380,37 @@ def _train_step(
         features = jnp.asarray(outputs["decoder"]["__call__"][0], jnp.float32)
         action_q_quants = jnp.take_along_axis(q_quants, actions[..., None], -1)
 
-        policy_log_probs = nnx.log_softmax(q_quants.mean(-2) / temperature)
+        qs = q_quants.mean(-2)
+        policy_log_probs = nnx.log_softmax(qs / temperature)
         policy_entropy = -jnp.sum(jnp.exp(policy_log_probs) * policy_log_probs, -1)
 
-        # Munchausen's log-policy is read off that online pass, over its samples rather than a
-        # redraw, where the Munchausen paper's Eq. 7 and BTR's Eq. E1 both write the target net:
-        # BTR's *code* reads it online (`q_k_target = self.net.qvals(states)` in Agent.py) and
-        # that is the version its published curve came from. The two differ by up to
-        # TARGET_NETWORK_UPDATE_FREQ steps of staleness, and online drops a whole trunk pass over
-        # obs -- +13.5% on the run's rate, see the performance block. stop_gradient because the
-        # term is part of the target, not of what is being fitted.
+        top_two = jax.lax.top_k(qs, 2)[0]
+        action_gap = top_two[..., 0] - top_two[..., 1]
+        max_qs = top_two[..., 0]
+
+        # docs/temperature.tex's two per-state scales: the mean gap, and the spread of the
+        # action ordering across quantiles. Over IQN_TRAIN_SAMPLES quantiles, so their levels
+        # differ from the offline probe's (docs/behaviour-policy.md).
+        gap_bar = (max_qs[..., None] - qs).mean(-1)
+        sigma_rank = (q_quants - q_quants.mean(-1, keepdims=True)).std(-2).mean(-1)
+
+        # What the behaviour policy gives up per decision against the greedy action, in reward
+        # units. Blind to the NoisyNet draw's own cost: a draw's argmax is this q's argmax.
+        if soft_sampling:
+            behaviour = nnx.softmax(qs / act_temperature)
+            regret = max_qs - (behaviour * qs).sum(-1)
+        else:
+            regret = jnp.zeros_like(action_gap)
+        regret = (1 - epsilon) * regret + epsilon * (max_qs - qs.mean(-1))
+
+        # Off the online pass, as BTR's code does (``self.net.qvals(states)`` in Agent.py),
+        # where Munchausen's Eq. 7 and BTR's Eq. E1 write the target net. It saves a trunk pass.
         action_log_probs = jax.lax.stop_gradient(
             jnp.take_along_axis(policy_log_probs, actions, -1)
         )
 
-        # Added once, unscaled by n, with the clip inside the scaling -- Eq. E1 and BTR's code
-        # agree, so the term stays a one-step correction bolted onto an n-step return rather
-        # than being scaled by (gamma^n - 1)/(gamma - 1).
+        # Added once and unscaled by n, with the clip inside the scaling, as Eq. E1 and BTR's
+        # code both do.
         munchausen_rewards = rewards + munchausen_scaling_term * (
             temperature * action_log_probs
         ).clip(munchausen_clipping_val, 0)
@@ -661,9 +428,8 @@ def _train_step(
             -1,
         )
 
-        # One discount ** n_steps for the whole batch is right: the buffer accumulates the
-        # n-step return itself and redraws any rollout a time limit would have cut short,
-        # so every drawn transition spans exactly n_steps or ends terminal.
+        # The buffer redraws any rollout a time limit would cut short, so every transition
+        # spans exactly n_steps or ends terminal.
         target_q_quants = (
             munchausen_rewards
             + jnp.where(dones, 0, discount**n_steps) * next_value_quants
@@ -677,25 +443,40 @@ def _train_step(
         transition_losses = total_loss.mean(-1).sum(-1)
         total_loss = jnp.mean(importance_sampling_weights * transition_losses)
 
-        return total_loss, (td_error, action_q_quants, policy_entropy, features)
+        return total_loss, RawStats(
+            td_error,
+            action_q_quants,
+            policy_entropy,
+            action_gap,
+            regret,
+            gap_bar,
+            sigma_rank,
+            features,
+        )
 
     loss: jax.Array
-    td_error: jax.Array
-    q_quants: jax.Array
-    policy_entropy: jax.Array
-    features: jax.Array
-    (loss, (td_error, q_quants, policy_entropy, features)), grads = nnx.value_and_grad(
-        loss_fn, has_aux=True
-    )(qnet, target_qnet, rngs)
+    raw_stats: RawStats
+    ((loss, raw_stats), grads) = nnx.value_and_grad(loss_fn, has_aux=True)(
+        qnet, target_qnet, rngs
+    )
+
+    (
+        td_error,
+        q_quants,
+        policy_entropy,
+        action_gap,
+        regret,
+        gap_bar,
+        sigma_rank,
+        features,
+    ) = raw_stats
 
     mean_td_error = td_error.mean((-2, -1))
     mean_abs_td_error = jnp.abs(td_error).mean((-2, -1))
     new_prios = (mean_abs_td_error + PER_EPSILON) ** PER_ALPHA
 
-    # grad_norm is the whole gradient, which is what the clip reads. The ratio below runs over
-    # the parameters weights/global_norm keeps on both sides -- halves covering different
-    # parameters are not a ratio -- and takes them here rather than from diagnostic_scales, which
-    # learn_step runs after the update and on a coarser cadence.
+    # grad_norm is the whole gradient, as the clip reads it; grad_to_weight takes both norms
+    # over the same masked parameters.
     grad_norm = optax.global_norm(grads)
     param_mask = unnormalised_param_mask(qnet)
     weight_norm = optax.global_norm(
@@ -711,9 +492,27 @@ def _train_step(
         "train/td_error": (buffer_weights * mean_td_error).sum(),
         "train/q": (buffer_weights * q_quants.mean((-2, -1))).sum(),
         "train/policy_entropy": (buffer_weights * policy_entropy).sum(),
+        "train/action_gap": (buffer_weights * action_gap).sum(),
+        "train/regret": (buffer_weights * regret).sum(),
+        "train/gap_bar": (buffer_weights * gap_bar).sum(),
+        "train/sigma_rank": (buffer_weights * sigma_rank).sum(),
+        "train/gap_over_sigma_rank": (buffer_weights * gap_bar / sigma_rank).sum(),
         "train/grad_norm": grad_norm,
         "train/grad_to_weight": weight_grad_norm / weight_norm,
     }
+    # Over the batch as PER drew it, unweighted, where the means above are reweighted onto
+    # uniform replay.
+    percentiles = (5, 50, 95)
+    for name, values in (
+        ("policy_entropy", policy_entropy),
+        ("action_gap", action_gap),
+        ("regret", regret),
+        ("sigma_rank", sigma_rank),
+        ("gap_over_sigma_rank", gap_bar / sigma_rank),
+    ):
+        quantiles = jnp.percentile(values, jnp.asarray(percentiles, jnp.float32))
+        for index, percentile in enumerate(percentiles):
+            stats[f"train/{name}_p{percentile}"] = quantiles[index]
     stats |= feature_scales(features, num_channels=qnet.decoder.out_channels)
 
     opt.update(qnet, grads)
@@ -721,42 +520,21 @@ def _train_step(
     return new_prios, stats
 
 
-# Once every SCALE_LOG_FREQ steps
 @nnx.jit(graph=False)
 def _scale_stats(qnet: QNet, opt: nnx.Optimizer[QNet]) -> dict[str, jax.Array]:
     """
-    The per-parameter scale diagnostics, keyed by scalar name and left on the device for the
-    caller to drain with the rest.
-
-    A kernel of its own rather than part of ``_train_step``: it reads the network and the
-    optimizer and needs neither a batch nor a gradient, so the cadence it runs on is free to be
-    far coarser than the step's. It still has to be jitted -- dispatched one at a time, its ~130
-    reductions over every parameter and every Adam moment cost 48 ms of host against 1.4 here.
-
-    ``graph=False`` puts both arguments through as plain pytrees, which is all this needs: it
-    returns scalars and mutates nothing, so none of graph mode's reference semantics apply, while
-    graph mode writes the whole 21 MB of parameters and moments back out as fresh buffers on
-    every call.
+    The per-parameter scale diagnostics, left on the device. Apart from ``_train_step`` because
+    they need no batch and so run on a coarser cadence. ``graph=False`` because this mutates
+    nothing, and graph mode would write every parameter and moment back out on each call.
     """
     return diagnostic_scales(qnet) | adam_optim_scales(opt, qnet)
 
 
 def sync_qnet(qnet: QNet, target_qnet: QNet) -> None:
     """
-    Point ``target_qnet`` at the arrays ``qnet`` holds now.
-
-    Not jitted, and not a copy: JAX arrays are immutable, so the target keeps what the source
-    held at the call and a later ``opt.update`` cannot reach through the alias. Checked against
-    the jitted copy this replaces -- parameters, the actions the two nets draw, the flags, and
-    SpectralNorm's carried ``u`` under acting.
-
-    It drops 6.7 ms of host a sync, all of it nnx graph traversal for a call that did nothing on
-    the device, and that buys no wall time: 2253 against 2247 env steps/s. The loop is
-    device-bound with host to spare, which is what every host figure in the performance block
-    comes to.
-
-    An alias is what a donated buffer would break, so the donate_argnums the backlog wants has
-    to leave the two nets this hands out of it.
+    Point ``target_qnet`` at the arrays ``qnet`` holds now. An alias, not a copy: JAX arrays are
+    immutable, so a later ``opt.update`` cannot reach the target. Donating these buffers would
+    break that.
     """
     nnx.update(target_qnet, nnx.state(qnet))
 
@@ -765,12 +543,9 @@ def make_inference_qnet(
     num_actions: int, obs_shape: tuple[int, int, int], rngs: nnx.Rngs
 ) -> QNet:
     """
-    A network built to act with and never to train, for the paths that load weights into one
-    rather than cloning a live net through ``sync_qnet``.
-
-    ``use_running_average`` is the flag sync sets, and only that flag: ``eval()`` sets more than
-    this one and would change what ``act`` does. Its SpectralNorm layers then read the carried
-    ``u`` without advancing it.
+    A network to load weights into and act with, never to train. ``use_running_average`` makes
+    its SpectralNorm layers read the carried ``u`` without advancing it; ``eval()`` would set
+    more flags than that one.
     """
     qnet = QNet(num_actions, obs_shape=obs_shape, layer_norm=LAYER_NORM, rngs=rngs)
     qnet.set_attributes(use_running_average=True, raise_if_not_found=False)
@@ -779,11 +554,8 @@ def make_inference_qnet(
 
 def eval_epsilon_at(num_frames: int) -> float:
     """
-    Evaluation epsilon after ``num_frames`` ALE frames.
-
-    BTR scores with a little noise until 125M frames -- 25M past the point training stops
-    exploring -- and only reports the fully greedy policy after that (Table D6). Kept whole, and
-    reading 0 throughout, while the epsilon constants above are zeroed.
+    Evaluation epsilon after ``num_frames`` ALE frames: EVAL_EPS_GREEDY, then 0 from
+    EVAL_EPS_GREEDY_OFF_FRAMES, as in BTR's Table D6.
     """
     return EVAL_EPS_GREEDY if num_frames < EVAL_EPS_GREEDY_OFF_FRAMES else 0.0
 
@@ -797,18 +569,9 @@ def _behaviour(
     evaluation: bool,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """
-    The acting half of both ``BTR`` and ``QNetPolicy``: pick the epsilon this many frames in,
-    then draw.
-
-    ``act`` is ``_act`` with its net already bound, not the net, because both callers act with
-    one net for their whole life and binding it is what keeps nnx from walking its 159 nodes
-    again on every env step -- see where they bind it.
-
-    The log-probability handed back, which the run logs as ``run/action_log_prob``, is the one
-    of the action actually taken, so it is the behaviour policy's own surprise rather than a
-    property of the learned q. It is conditional
-    on this call's NoisyNet draw, so it reads more deterministic than the marginal policy is;
-    see ``_act``. A ceiling on the soft policy's collapse toward argmax, not a measurement of it.
+    The acting half of ``BTR`` and ``QNetPolicy``: pick the epsilon for this many frames, then
+    draw with ``act``, which is ``_act`` bound to the caller's net. Evaluation takes the argmax.
+    The log-probability comes back as ``log_prob``, logged as ``run/action_log_prob``.
     """
     epsilon = eval_epsilon_at(num_frames) if evaluation else epsilon_at(num_frames)
     actions, log_probs = act(
@@ -822,10 +585,8 @@ def _behaviour(
 
 class QNetPolicy(Policy):
     """
-    A ``QNet`` that is only ever loaded into, for scoring and for watching.
-
-    Its RNG streams are its own, so acting with it does not disturb the draws a training run is
-    making on another thread.
+    A ``QNet`` that is only ever loaded into, for scoring and for watching. Its RNG streams are
+    its own, so acting with it does not disturb a training run's draws.
     """
 
     def __init__(
@@ -834,11 +595,8 @@ class QNetPolicy(Policy):
         self._frames_per_step = frames_per_step
         self._rngs = create_rngs(0)
         self.qnet = make_inference_qnet(num_actions, obs_shape, self._rngs)
-        # The binding caches the walk over this net's graph, not its values: the clone
-        # cached_partial keeps holds the same Variable objects, so ``load`` writing into them
-        # is seen here. It is ``self.qnet`` never being *replaced* that keeps this valid.
-        # Worth 3.8 -> 1.6 ms of host an act, which on the evaluator's thread is that much
-        # less GIL held against the training loop's own dispatch.
+        # Caches the graph walk, not the values: the binding shares the net's Variables, so
+        # ``load`` shows through. Valid only while ``self.qnet`` is never replaced.
         self._act = nnx.cached_partial(_act, self.qnet)
 
     @override
@@ -847,9 +605,7 @@ class QNetPolicy(Policy):
 
     @override
     def load(self, weights: Mapping[str, Any], *, seed: int) -> None:
-        # nnx.update writes variables and nothing else, so the flags make_inference_qnet set
-        # survive it. The streams are replaced rather than carried on, since they are passed to
-        # every call as arguments and nothing holds a reference to the old ones.
+        # nnx.update writes variables only, so make_inference_qnet's flag survives it.
         nnx.update(self.qnet, weights["qnet"])
         self._rngs = create_rngs(seed)
 
@@ -894,6 +650,7 @@ class BTR(Agent):
         self._frames_per_step = frames_per_step
         self._seed = seed
         self._num_updates = 0
+        self._num_frames = 0
         self._max_prio = 1.0
         self._buf: ReplayBuffer | None = None
         self._prio_queue = deque()
@@ -903,18 +660,13 @@ class BTR(Agent):
         self.qnet = QNet(
             num_actions, obs_shape=obs_shape, layer_norm=LAYER_NORM, rngs=self.rngs
         )
-        # Neither clone is checkpointed, since sync_qnet rebuilds both from qnet. The flag is
-        # what stops their passes advancing the power iteration outside a gradient step, and
-        # nnx.update writes variables and nothing else, so every later sync leaves it standing
-        # and it is set here once rather than on each of them.
+        # Not checkpointed: sync_qnet rebuilds both from qnet. The flag stops their passes
+        # advancing SpectralNorm's power iteration, and survives every sync.
         self.target_qnet = nnx.clone(self.qnet)
         self.inference_qnet = nnx.clone(self.qnet)
         for net in (self.target_qnet, self.inference_qnet):
             net.set_attributes(use_running_average=True, raise_if_not_found=False)
-        # As in QNetPolicy: the walk over the acting net's graph is cached here rather than
-        # repeated every iteration, and the sync_qnet writing into that net is seen through it
-        # because both hold the same Variable objects -- which is also why ``restore`` reaches
-        # a bound kernel. It is the modules never being *replaced* that keeps both valid.
+        # Bound as in QNetPolicy; sync_qnet and restore write through the shared Variables.
         self._act = nnx.cached_partial(_act, self.inference_qnet)
 
         self.opt = nnx.Optimizer(
@@ -934,13 +686,8 @@ class BTR(Agent):
             wrt=nnx.Param,
         )
 
-        # Bound like _act: 14.1 -> 7.0 ms of host a call, all of it nnx's graph walk. Three
-        # things make it safe, each measured rather than reasoned about: opt.update leaves the
-        # graph structure alone, so the cache cannot go stale across a step; nnx.capture's
-        # sowing -- it assigns __captures__ on every submodule it walks -- still reaches these
-        # modules, so the plasticity diagnostics stay live and track the unbound kernel's to
-        # 4e-4; and none of it survives the call, so nnx.state(qnet) is the same 82 leaves a
-        # checkpoint held before. Bound last of all: it holds opt, which holds qnet.
+        # Bound like _act, which holds because opt.update leaves the graph structure alone.
+        # Last, since opt holds qnet.
         self._train_step = nnx.cached_partial(
             _train_step, self.qnet, self.target_qnet, self.opt, self.rngs
         )
@@ -953,15 +700,7 @@ class BTR(Agent):
     @property
     @override
     def hyperparameters(self) -> dict[str, bool | int | float | str]:
-        """
-        Swept up wholesale from the module's constants, so the table stays correct as that block
-        grows. TRAIN_LOG_FREQ and SCALE_LOG_FREQ come with them: they do not change what a run
-        means, but they do set how densely its curves are drawn, which is worth having beside
-        the curves being compared.
-
-        A Fraction goes in as the float nearest it, since the table holds scalars and nothing
-        reads these back: the exactness is for the arithmetic, not for the record of it.
-        """
+        """Every upper-case scalar constant in this module; a Fraction as its nearest float."""
         return {
             f"btr/{name}": float(value) if isinstance(value, Fraction) else value
             for name, value in globals().items()
@@ -971,18 +710,12 @@ class BTR(Agent):
     @override
     def init(self, obs: npt.NDArray[Any]) -> None:
         num_envs = obs.shape[0]
-        # A burst settles its own oldest batch, so the queue has to carry what an iteration
-        # dispatches before PRIO_QUEUE_SLACK is worth anything: sized this way, the write-back
-        # reads a batch the device has had a whole iteration to finish however high the ratio is,
-        # where a fixed depth would put it on one dispatched moments earlier.
+        # An iteration's own dispatches plus the slack, so the write-back always reads a batch
+        # dispatched an iteration earlier, whatever the ratio.
         self._prio_queue_len = math.ceil(REPLAY_RATIO * num_envs) + PRIO_QUEUE_SLACK
 
-        # An environment can only be drawn from once it holds enough slots for a draw's frame
-        # stack to read backwards over and its rollout to read forwards over, which is
-        # obs_stack + N_STEP - 1 transitions. learn_step's gate counts the whole buffer, so a
-        # TRAIN_START_BUF_SIZE spread thinly enough over environments would open it on a buffer
-        # no draw can serve; refused here, where both numbers are known, rather than surfacing
-        # as a ValueError out of the first sample halfway into a run.
+        # A draw needs obs_stack + N_STEP - 1 transitions in its environment, while
+        # learn_step's gate counts the whole buffer.
         per_env_start = TRAIN_START_BUF_SIZE // num_envs
         samplable_at = self._obs_shape[0] + N_STEP - 1
         if per_env_start < samplable_at:
@@ -1011,6 +744,8 @@ class BTR(Agent):
         self, obs: npt.NDArray[Any], *, num_env_steps: int, evaluation: bool = False
     ) -> tuple[jax.Array, dict[str, jax.Array]]:
         """On inference_qnet: acting on qnet would advance its power iteration."""
+        if not evaluation:
+            self._num_frames = num_env_steps * self._frames_per_step
         return _behaviour(
             self._act,
             obs,
@@ -1022,31 +757,14 @@ class BTR(Agent):
     @override
     def observe(self, step: EnvStep) -> None:
         """
-        Settle up for the gradient steps that have finished, then store.
+        Write back the priorities of finished gradient steps, then store the step.
 
-        Settling up is a device transfer, and reading back the step just dispatched costs the
-        host the whole of that step -- 12.9 ms an iteration, against 0.22 ms in ``save_step``
-        below. An iteration's own gradient steps and ``PRIO_QUEUE_SLACK`` more stay in flight
-        instead, so the transfer reads a step the device finished an iteration ago and the
-        sampling and upload in the following ``learn_step`` overlap the one still running.
-
-        What that spends is the exactness of the write-back. A batch is drawn against one write
-        head and written back against a head at most ``PRIO_QUEUE_SLACK`` save_steps further on
-        -- fewer the higher ``REPLAY_RATIO`` is, since the queue then turns over inside an
-        iteration rather than across several -- so a slot within that distance of wrapping has
-        been recycled underneath it and its new occupant takes the old one's priority. A
-        save_step advances a head once, twice across an episode boundary, which bounds it at
-        ``2 * PRIO_QUEUE_SLACK`` slots of an environment's capacity -- four of 16384 here, so
-        0.06 draws of a 256 batch. It cannot make an unsamplable slot drawable: the buffer
-        rejects a proposal on slot type, not on priority.
-
-        The other half of that is what the delayed batches are still worth to the sampler: until
-        its write-back lands, a batch keeps the priority it was drawn on, so the transitions of
-        the gradient steps still in flight are offered at the error that selected them rather
-        than the one they now have, and are drawn again at it. ``PER_ALPHA`` is low enough that
-        the draw is near uniform, which puts that at 256 * 256 / 1048576 = 0.06 of a batch per
-        following draw, 0.13 over the two in flight here -- the same order as the recycling
-        above, and growing with the queue the same way, ratio included.
+        Only batches at least an iteration old are written back, since reading the step just
+        dispatched would wait on the device. That costs exactness in two ways. A slot recycled
+        between a batch's draw and its write-back inherits the old priority: at most
+        ``2 * PRIO_QUEUE_SLACK`` slots per environment, and never an unsamplable one, since the
+        buffer rejects on slot type. And until its write-back lands, a batch's transitions are
+        sampled at the priority they were drawn on.
         """
         assert self._buf is not None, "observe before init"
 
@@ -1058,16 +776,12 @@ class BTR(Agent):
             step.truncated,
             step.next_obs,
         )
-        # What the next learn_step has to spend. Accrued here rather than counted there because
-        # this is the call that sees how much experience arrived.
         self._grad_steps_owed += REPLAY_RATIO * self._buf.num_envs
 
     def _write_back_prios(self) -> None:
         """
-        Settle the batches that have been in flight longest, leaving room in the queue for one
-        more. Called once an iteration from ``observe``, which is where the transfer is oldest
-        and so cheapest, and again from ``learn_step`` for the steps of a burst past the first,
-        which have no ``observe`` between them to settle up for them.
+        Write back the batches in flight longest, leaving room in the queue for one more. Called
+        from ``observe``, and from ``learn_step`` between the steps of a burst.
         """
         assert self._buf is not None, "_write_back_prios before init"
 
@@ -1078,33 +792,20 @@ class BTR(Agent):
     @override
     def learn_step(self) -> tuple[int, dict[str, jax.Array]]:
         """
-        Every whole gradient step REPLAY_RATIO owes for the experience observed so far, taken
-        once the buffer has filled, dispatched and left in flight, and the scalars to log for
-        them -- empty on the steps between writes.
-
-        Which steps those are is decided here rather than by the run because it is a property of
-        what the scalars cost to produce. What _train_step returns is computed either way, since
-        it is reductions over arrays that step already holds; TRAIN_LOG_FREQ only thins the
-        transfer. _scale_stats is a kernel of its own, so SCALE_LOG_FREQ decides whether its ~130
-        reductions run at all. A call taking several steps reports the newest of them that lands
-        on a write, so the cadences stay what those constants say whatever the ratio is.
+        Take every whole gradient step REPLAY_RATIO owes, once the buffer has filled, and leave
+        them in flight. The scalars returned are those of the newest step landing on
+        TRAIN_LOG_FREQ or SCALE_LOG_FREQ, and empty if none does.
         """
         assert self._buf is not None, "learn_step before init"
         if len(self._buf) < TRAIN_START_BUF_SIZE:
-            # The fill's own steps are dropped rather than carried: they would come due in one
-            # burst against a buffer holding a single policy's experience, which is the opposite
-            # of what a replay ratio is for. A resumed run's refill is dropped the same way.
+            # Dropped, not carried: they would come due in one burst on a single policy's data.
             self._grad_steps_owed = Fraction(0)
             return 0, {}
 
-        # The remainder is carried, so a ratio that owes a fraction of a step an iteration
-        # spends it on the iteration it completes it rather than rounding it away.
         num_steps, self._grad_steps_owed = divmod(self._grad_steps_owed, 1)
 
         stats: dict[str, jax.Array] = {}
         for _ in range(num_steps):
-            # Once an iteration this is the no-op that observe already did; past that it is what
-            # keeps the batches in flight bounded by the queue rather than by the ratio.
             self._write_back_prios()
 
             (
@@ -1124,6 +825,7 @@ class BTR(Agent):
                 rewards=batch_rewards,
                 dones=batch_dones,
                 next_obs=batch_next_obs,
+                epsilon=epsilon_at(self._num_frames),
             )
             new_prios.copy_to_host_async()
             self._prio_queue.append((batch_indices, new_prios))
@@ -1136,8 +838,6 @@ class BTR(Agent):
 
             writes_scales = self._num_updates % SCALE_LOG_FREQ == 0
             if writes_scales:
-                # Dispatched like the step above and drained with the rest, and reading the state
-                # that step just wrote, so the host pays one launch for all ~130 of them.
                 step_stats |= _scale_stats(self.qnet, self.opt)
             if writes_scales or self._num_updates % TRAIN_LOG_FREQ == 0:
                 stats = step_stats
@@ -1147,13 +847,8 @@ class BTR(Agent):
     @override
     def stats(self) -> dict[str, float]:
         """
-        run/buffer_transitions counts the unsamplable window around each write head too, so it
-        reaches BUFFER_SIZE slightly before every slot is a drawable transition.
-
-        A fresh run holds min(num_env_steps, BUFFER_SIZE), which is the step count every other
-        curve is already drawn against. A resumed one refills from empty while that count
-        carries on, so this is the only series that shows the refill -- which is the open
-        question in the backlog above.
+        run/buffer_transitions includes the unsamplable slots around each write head. It is the
+        one series that shows a resumed run's refill.
         """
         if self._buf is None:
             return {}
@@ -1162,13 +857,9 @@ class BTR(Agent):
     @override
     def policy_weights(self) -> dict[str, Any]:
         """
-        The clone is what pins a snapshot to these weights: ``nnx.state`` aliases the live
-        ``Param`` objects, so without it a reader on another thread would see whatever
-        ``opt.update`` had written by the time it got there. It rebuilds the pytree around the
-        same device arrays, so it costs nothing and does not wait on a step still computing them.
-
-        Keyed as ``QNetPolicy.checkpointables``, which is the same key this agent checkpoints
-        its acting weights under.
+        Cloned because ``nnx.state`` aliases the live Params, which ``opt.update`` writes to. The
+        clone shares the device arrays, so it costs nothing. Keyed as
+        ``QNetPolicy.checkpointables``.
         """
         return {"qnet": nnx.clone(nnx.state(self.qnet))}
 
@@ -1183,9 +874,8 @@ class BTR(Agent):
     @override
     def checkpointables(self) -> dict[str, Any]:
         """
-        ``max_prio`` rides along because the buffer itself does not: a resumed run would
-        otherwise refill an empty buffer at a fresh one's 1.0 rather than the scale training had
-        reached.
+        ``max_prio`` is saved because the buffer is not: a resumed run refills at the priority
+        scale training reached, not at 1.0.
         """
         max_prio = self._max_prio if self._buf is None else self._buf.max_prio
         # TODO: we should probably store most if not all hyper-parameters here.
@@ -1208,5 +898,5 @@ class BTR(Agent):
         sync_qnet(self.qnet, self.inference_qnet)
 
         self._num_updates = restored["counters"]["num_updates"]
-        # Read at init, since the buffer holds it read-only once it exists.
+        # Read by init; the buffer holds it read-only.
         self._max_prio = restored["replay"]["max_prio"]
