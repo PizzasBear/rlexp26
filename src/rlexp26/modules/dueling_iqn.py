@@ -12,6 +12,8 @@ class DuelingIQNHead(eqx.Module):
     advantage stream of two NoisyLinears each, ``value + advantage - mean(advantage)``. Reads
     one sample's features and ``taus``, ``[num_levels]``, and returns
     ``[num_levels, num_actions]``, with one draw of noise for all the levels.
+    ``advantage_only`` skips the value stream: each level's values are then off by one
+    constant across the actions, which an argmax or a softmax over them does not read.
     """
 
     embedding: IQNCosineEmbedding
@@ -39,15 +41,24 @@ class DuelingIQNHead(eqx.Module):
         self.advantage1 = NoisyLinear(hidden, num_actions, key=keys[4])
 
     @jax.named_scope("DuelingIQNHead")
-    def __call__(self, x: jax.Array, taus: jax.Array, *, key: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: jax.Array,
+        taus: jax.Array,
+        *,
+        key: jax.Array,
+        advantage_only: bool = False,
+    ) -> jax.Array:
         keys = jr.split(key, 4)
 
         def level(tau: jax.Array) -> jax.Array:
             h = x * self.embedding(tau)
-            v = self.value1(jax.nn.relu(self.value0(h, key=keys[0])), key=keys[1])
             a = self.advantage1(
                 jax.nn.relu(self.advantage0(h, key=keys[2])), key=keys[3]
             )
+            if advantage_only:
+                return a - a.mean()
+            v = self.value1(jax.nn.relu(self.value0(h, key=keys[0])), key=keys[1])
             return v + a - a.mean()
 
         return jax.vmap(level)(taus)

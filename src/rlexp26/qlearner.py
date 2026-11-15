@@ -28,6 +28,10 @@ from .replay import Batch, Draw, ReplayMemory
 TRAIN_LOG_FREQ = 100
 # Gradient steps between _parameter_stats' scalars, a multiple of TRAIN_LOG_FREQ.
 PARAMETER_LOG_FREQ = 1000
+# Gradient steps between _score's scalars, a multiple of TRAIN_LOG_FREQ.
+HELDOUT_LOG_FREQ = 1000
+# Transitions per side of a _score, taken in batches of batch_size.
+HELDOUT_SAMPLES = 1024
 # The parts of the net the parameter scalars are taken over (QNet.parameter_groups).
 PARTS = ("trunk", "head", "readout")
 
@@ -125,11 +129,12 @@ class QLearner(Agent):
 
     - ``net`` and ``state``, a QNet on stacked image observations, and ``optimiser`` for its
       floating arrays. The target and acting nets are ``net`` in inference mode.
-    - ``returns`` reads the net in a gradient step and ``act_returns`` when acting.
+    - ``returns`` reads the net in a gradient step and ``act_returns`` when acting, whose
+      ``means`` need be right only up to a constant per sample.
     - ``temperature`` is the Munchausen one, and the behaviour policy's where ``soft``: actions
       are then drawn from softmax(Q / temperature), and otherwise are the argmax. Either is
       replaced by a uniform action with probability ``epsilon(num_env_steps)``.
-      ``eval_epsilon`` is the same for the policy ``policy()`` hands out, always an argmax.
+      ``eval_epsilon`` is the same for the policy ``policy`` hands out, always an argmax.
     - ``augment(obs, key)`` is applied to a training batch's observations and next
       observations apart, and ``project(params)`` after every optimiser step.
     - ``hyperparameters`` is what the property of that name reports.
@@ -175,7 +180,7 @@ class QLearner(Agent):
         _, self._inference_static = eqx.partition(
             eqx.nn.inference_mode(net), eqx.is_inexact_array
         )
-        learner_key, self._act_key, memory_key = jr.split(key, 3)
+        learner_key, self._act_key, memory_key, self._heldout_key = jr.split(key, 4)
         learner = Learner(
             params=params,
             state=state,
@@ -190,8 +195,10 @@ class QLearner(Agent):
         self._learner = tuple(jax.tree.leaves(learner))
         self._labels = tuple(jax.tree.leaves(net.parameter_groups()))
         self._memory_key = memory_key
+        self._heldout_seed = int(jr.bits(self._heldout_key, dtype=jnp.uint32))
         self._uploaded: tuple[Draw, Batch] | None = None
         self._memory: ReplayMemory | None = None
+        self._num_heldout = 0
         self._max_prio = 1.0
         self._num_updates = 0
         self._num_env_steps = 0
@@ -212,6 +219,7 @@ class QLearner(Agent):
 
         self._train_burst = jax.jit(train_burst)
         self._parameter_scalars = jax.jit(self._parameter_stats)
+        self._heldout_scalars = jax.jit(self._score)
 
     def _choose_actions(
         self,
@@ -249,13 +257,29 @@ class QLearner(Agent):
         )
         return actions, step + 1
 
-    def _train_step(
-        self, learner: Learner, batch: Batch, *, epsilon: jax.Array
-    ) -> tuple[Learner, tuple[jax.Array, dict[str, jax.Array]]]:
+    def _loss(
+        self,
+        params: PyTree[jax.Array],
+        learner: Learner,
+        batch: Batch,
+        keys: tuple[jax.Array, jax.Array, jax.Array],
+    ) -> tuple[
+        jax.Array,
+        tuple[
+            eqx.nn.State,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            dict[str, jax.Array],
+        ],
+    ]:
         """
-        One gradient step on one batch, ``[batch, ...]``. Returns the new learner and, as a
-        pair, every transition's new priority and the scalars. ``epsilon`` is the behaviour
-        policy's, for the regret.
+        The loss of ``params`` on one batch, ``[batch, ...]``, against ``learner``'s target
+        net, from ``learner``'s state, under PER's importance weights. Returns it and, as aux,
+        the new state, every transition's action values and the taken action's, signed and
+        absolute TD errors and the return distribution's diagnostics. ``keys`` are the online
+        pass', the target pass' and the augmentation's.
 
         The target is the n-step Munchausen one. The taken action's scaled log-policy is added
         to the return once, off the online pass. The next state is valued under the target
@@ -264,8 +288,8 @@ class QLearner(Agent):
         """
         common, replay, returns = self._common, self._replay, self._returns
         temperature = self._temperature
-        key, online_key, target_key, augment_key = jr.split(learner.key, 4)
-        prios, weights, frames, actions, rewards, lengths, terminated = map(
+        online_key, target_key, augment_key = keys
+        prios, _, frames, actions, rewards, lengths, terminated = map(
             jnp.asarray, batch
         )
         stack = frames.shape[1] - common.n_step
@@ -287,52 +311,60 @@ class QLearner(Agent):
         is_weights = prios**-replay.per_beta
         is_weights /= is_weights.max()
         target_params, target_state = learner.target
-        target_net = eqx.combine(target_params, self._inference_static)
+        out, state = returns.forward(
+            eqx.combine(params, self._static),
+            obs,
+            learner.state,
+            key=online_key,
+            taken=actions,
+        )
+        qs = returns.means(out)
+        log_policy = jax.nn.log_softmax(jax.lax.stop_gradient(qs) / temperature)
+        next_out, _ = returns.forward(
+            eqx.combine(target_params, self._inference_static),
+            next_obs,
+            target_state,
+            key=target_key,
+        )
+        next_log_policy = jax.nn.log_softmax(returns.means(next_out) / temperature)
+        next_policy = jnp.exp(next_log_policy)
+        next_entropy = -jnp.sum(next_policy * next_log_policy, -1)
+        munchausen = common.munchausen_scaling_term * jnp.clip(
+            temperature * log_policy[rows, actions],
+            common.munchausen_clipping_val,
+            0,
+        )
+        losses, td_error, abs_td_error, returns_stats = returns.loss(
+            out,
+            actions,
+            next_out,
+            next_policy,
+            rewards + munchausen + next_discount * temperature * next_entropy,
+            next_discount,
+        )
+        return jnp.mean(is_weights * losses), (
+            state,
+            qs,
+            qs[rows, actions],
+            td_error,
+            abs_td_error,
+            returns_stats,
+        )
 
-        def loss_fn(
-            params: PyTree[jax.Array],
-        ) -> tuple[
-            jax.Array,
-            tuple[eqx.nn.State, jax.Array, jax.Array, jax.Array, dict[str, jax.Array]],
-        ]:
-            out, state = returns.forward(
-                eqx.combine(params, self._static),
-                obs,
-                learner.state,
-                key=online_key,
-                taken=actions,
+    def _train_step(
+        self, learner: Learner, batch: Batch, *, epsilon: jax.Array
+    ) -> tuple[Learner, tuple[jax.Array, dict[str, jax.Array]]]:
+        """
+        One gradient step of ``_loss`` on one batch, ``[batch, ...]``. Returns the new learner
+        and, as a pair, every transition's new priority and the scalars. ``epsilon`` is the
+        behaviour policy's, for the regret.
+        """
+        common, replay, temperature = self._common, self._replay, self._temperature
+        key, *loss_keys = jr.split(learner.key, 4)
+        (loss, (state, qs, taken, td_error, abs_td_error, returns_stats)), grads = (
+            jax.value_and_grad(self._loss, has_aux=True)(
+                learner.params, learner, batch, tuple(loss_keys)
             )
-            qs = returns.means(out)
-            log_policy = jax.nn.log_softmax(jax.lax.stop_gradient(qs) / temperature)
-            next_out, _ = returns.forward(
-                target_net, next_obs, target_state, key=target_key
-            )
-            next_log_policy = jax.nn.log_softmax(returns.means(next_out) / temperature)
-            next_policy = jnp.exp(next_log_policy)
-            next_entropy = -jnp.sum(next_policy * next_log_policy, -1)
-            munchausen = common.munchausen_scaling_term * jnp.clip(
-                temperature * log_policy[rows, actions],
-                common.munchausen_clipping_val,
-                0,
-            )
-            losses, td_error, abs_td_error, returns_stats = returns.loss(
-                out,
-                actions,
-                next_out,
-                next_policy,
-                rewards + munchausen + next_discount * temperature * next_entropy,
-                next_discount,
-            )
-            return jnp.mean(is_weights * losses), (
-                state,
-                qs,
-                td_error,
-                abs_td_error,
-                returns_stats,
-            )
-
-        (loss, (state, qs, td_error, abs_td_error, returns_stats)), grads = (
-            jax.value_and_grad(loss_fn, has_aux=True)(learner.params)
         )
         updates, opt_state = self._optimiser.update(
             grads, learner.opt_state, learner.params
@@ -362,14 +394,14 @@ class QLearner(Agent):
         } | returns_stats
         # Means estimate the memory's, not what the draw favours; percentiles are the batch's
         # as drawn.
-        memory_weights = 1 / weights
+        memory_weights = 1 / jnp.asarray(batch.weights)
         memory_weights /= memory_weights.sum()
         stats = {"loss/total": loss, "optim/grad_norm": optax.global_norm(grads)} | {
             name: memory_weights @ value
             for name, value in {
                 "loss/td_error": td_error,
                 "loss/abs_td_error": abs_td_error,
-                "value/q": qs[rows, actions],
+                "value/q": taken,
                 **spread,
             }.items()
         }
@@ -404,6 +436,45 @@ class QLearner(Agent):
             stats,
         )
 
+    def _score(
+        self, leaves: tuple[jax.Array, ...], batches: Batch, key: jax.Array
+    ) -> dict[str, jax.Array]:
+        """
+        ``_loss`` with no update on ``ReplayMemory.draw_heldout``'s batches, one at a time, as
+        a training batch is: the mean loss, signed and absolute TD error and taken action's
+        value of the training environments' under ``replay/``, of the held-out ones' under
+        ``heldout/``, and ``heldout/abs_td_ratio``, the held-out absolute TD error over the
+        training environments'.
+        """
+        learner: Learner = jax.tree.unflatten(self._structure, leaves)
+        sides, num_batches = batches.actions.shape[:2]
+
+        def score(
+            batch_and_key: tuple[Batch, jax.Array],
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            batch, key = batch_and_key
+            loss, (_, _, taken, td_error, abs_td_error, _) = self._loss(
+                learner.params, learner, batch, tuple(jr.split(key, 3))
+            )
+            return loss, td_error.mean(), abs_td_error.mean(), taken.mean()
+
+        flat = jax.tree.map(
+            lambda x: jnp.reshape(x, (sides * num_batches, *x.shape[2:])), batches
+        )
+        means = jax.lax.map(score, (flat, jr.split(key, sides * num_batches)))
+        loss, td_error, abs_td_error, q = (
+            x.reshape(sides, num_batches).mean(-1) for x in means
+        )
+        stats = {"heldout/abs_td_ratio": abs_td_error[1] / abs_td_error[0]}
+        for side, prefix in enumerate(("replay", "heldout")):
+            stats |= {
+                f"{prefix}/loss": loss[side],
+                f"{prefix}/td_error": td_error[side],
+                f"{prefix}/abs_td_error": abs_td_error[side],
+                f"{prefix}/q": q[side],
+            }
+        return stats
+
     @property
     @override
     def num_updates(self) -> int:
@@ -415,7 +486,8 @@ class QLearner(Agent):
         return dict(self._hyperparameters)
 
     @override
-    def init(self, obs: npt.NDArray[Any]) -> None:
+    def init(self, obs: npt.NDArray[Any], *, num_heldout: int) -> None:
+        self._num_heldout = num_heldout
         self._memory = ReplayMemory(
             self._replay,
             obs,
@@ -427,6 +499,7 @@ class QLearner(Agent):
                 )
             ),
             max_prio=self._max_prio,
+            num_heldout=num_heldout,
         )
 
     @override
@@ -459,14 +532,18 @@ class QLearner(Agent):
         the batch drawn and uploaded a burst before it: an upload starts only once the device
         has run everything dispatched before it, so a burst whose batch went up just before it
         would wait out the copy. The scalars are those of the newest step landing on
-        TRAIN_LOG_FREQ, and empty if none does; one landing on PARAMETER_LOG_FREQ adds
-        _parameter_stats', dispatched behind the burst, so that like the rest they are still on
-        the device.
+        PARAMETER_LOG_FREQ, with _parameter_stats' added, or else on TRAIN_LOG_FREQ, and empty
+        if none does. Passing a multiple of HELDOUT_LOG_FREQ adds _score's. Those two are
+        dispatched behind the burst, so that like the rest they are still on the device.
         """
         assert self._memory is not None, "learn_step before init"
-        num_steps = 0
+        start = self._num_updates
         logged = dict[str, jax.Array]()
-        logged_step = 0
+        logged_step = -1
+
+        def rank(step: int) -> tuple[bool, int]:
+            return step % PARAMETER_LOG_FREQ == 0, step
+
         while (draw := self._memory.draw()) is not None:
             uploaded, self._uploaded = (
                 self._uploaded,
@@ -481,9 +558,12 @@ class QLearner(Agent):
             self._memory.update(draw, prios)
             first = self._num_updates
             self._num_updates += len(draw.handles)
-            num_steps += len(draw.handles)
-            last = self._num_updates - self._num_updates % TRAIN_LOG_FREQ
-            if last > first:
+            due = [
+                step
+                for freq in (PARAMETER_LOG_FREQ, TRAIN_LOG_FREQ)
+                if (step := self._num_updates - self._num_updates % freq) > first
+            ]
+            if due and rank(last := max(due, key=rank)) > rank(logged_step):
                 logged = {
                     name: value[last - first - 1] for name, value in stats.items()
                 }
@@ -491,7 +571,18 @@ class QLearner(Agent):
         norms = {name: logged.pop(name) for name in list(logged) if name[0] == "_"}
         if logged and logged_step % PARAMETER_LOG_FREQ == 0:
             logged |= self._parameter_scalars(self._learner, norms)
-        return num_steps, logged
+        heldout_step = self._num_updates - self._num_updates % HELDOUT_LOG_FREQ
+        if self._num_heldout and heldout_step > start:
+            batches = self._memory.draw_heldout(
+                max(1, HELDOUT_SAMPLES // self._replay.batch_size),
+                np.random.default_rng((self._heldout_seed, heldout_step)),
+            )
+            logged |= self._heldout_scalars(
+                self._learner,
+                batches,
+                jr.fold_in(self._heldout_key, heldout_step),
+            )
+        return self._num_updates - start, logged
 
     def _parameter_stats(
         self, leaves: tuple[jax.Array, ...], norms: dict[str, jax.Array]
@@ -584,9 +675,9 @@ class QLearner(Agent):
         return stats
 
     @override
-    def policy(self) -> Policy:
+    def policy(self, *, num_env_steps: int) -> Policy:
         return QPolicy(
-            self._greedy_act, self._learner, self._eval_epsilon(self._num_env_steps)
+            self._greedy_act, self._learner, self._eval_epsilon(num_env_steps)
         )
 
     @override

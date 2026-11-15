@@ -23,6 +23,7 @@ class QNet(eqx.Module):
     categorical one returns log-probabilities ``[batch, actions, atoms]``. ``key`` is one draw
     of noise for the whole batch. ``taken``, the actions a loss reads, is what the batch
     renorms after an ActionGatedHead's gates take their batch's moments from.
+    ``advantage_only`` is a DuelingIQNHead's.
     """
 
     trunk: ImpalaCNNLarge | NormalisedImpalaCNN
@@ -36,7 +37,9 @@ class QNet(eqx.Module):
         key: jax.Array,
         taus: jax.Array | None = None,
         taken: jax.Array | None = None,
+        advantage_only: bool = False,
     ) -> tuple[jax.Array, eqx.nn.State]:
+        assert not advantage_only or isinstance(self.head, DuelingIQNHead)
         x, state = jax.vmap(
             self.trunk, in_axes=(0, None), out_axes=(0, None), axis_name=BATCH_AXIS
         )(obs.astype(jnp.float32) / 255, state)
@@ -45,7 +48,9 @@ class QNet(eqx.Module):
         match head:
             case DuelingIQNHead():
                 assert taus is not None
-                return jax.vmap(partial(head, key=key))(x, taus), state
+                return jax.vmap(partial(head, key=key, advantage_only=advantage_only))(
+                    x, taus
+                ), state
             case CategoricalHead():
                 return jax.vmap(partial(head, key=key))(x), state
             case ActionGatedHead():

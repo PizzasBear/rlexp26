@@ -90,6 +90,10 @@ class Agent(ABC):
     ``observe`` / ``learn_step`` per iteration, with the ``act`` on a step's ``next_obs``
     dispatched before that step is observed. ``restore`` comes before ``init``, so that an agent
     whose memory is sized or seeded from the checkpoint can build it knowing both.
+
+    The last ``num_heldout`` environments are held out: the agent acts in them with the policy
+    that collects experience, as in the rest, and never learns from them. They exist for its
+    diagnostics, reported through ``learn_step``, of how it does on data it has not trained on.
     """
 
     @property
@@ -111,10 +115,11 @@ class Agent(ABC):
         """
 
     @abstractmethod
-    def init(self, obs: PyTree[npt.NDArray[Any]]) -> None:
+    def init(self, obs: PyTree[npt.NDArray[Any]], *, num_heldout: int) -> None:
         """
         The environments' first observations, before any action is taken: the number of
-        environments is their leading axis.
+        environments is their leading axis, the last ``num_heldout`` of them held out. An agent
+        that cannot hold any out raises unless it is 0.
         """
 
     @abstractmethod
@@ -164,8 +169,11 @@ class Agent(ABC):
         """
 
     @abstractmethod
-    def policy(self) -> Policy:
-        """The acting weights as they stand, detached from further updates."""
+    def policy(self, *, num_env_steps: int) -> Policy:
+        """
+        The acting weights as they stand, detached from further updates, as evaluated at the
+        run's step count ``num_env_steps``.
+        """
 
     @abstractmethod
     def checkpointables(self) -> dict[str, Any]:

@@ -31,10 +31,13 @@ class QuantileReturns:
     The return distributions of a net that answers ``[batch, levels, actions]`` values at the
     quantile levels it is given, IQN's: ``num_samples`` levels drawn uniformly per sample and
     pass, fitted with the quantile Huber of knee ``huber_k``. A ``ReturnDistribution``.
+    ``advantage_only`` reads a dueling head's advantage stream alone, so ``means`` are right
+    only up to a constant per sample: enough to act on, not to train.
     """
 
     num_samples: int
     huber_k: float
+    advantage_only: bool = False
 
     def forward(
         self,
@@ -47,7 +50,9 @@ class QuantileReturns:
     ) -> tuple[tuple[jax.Array, jax.Array], eqx.nn.State]:
         noise_key, tau_key = jr.split(key)
         taus = jr.uniform(tau_key, (obs.shape[0], self.num_samples))
-        values, state = net(obs, state, key=noise_key, taus=taus)
+        values, state = net(
+            obs, state, key=noise_key, taus=taus, advantage_only=self.advantage_only
+        )
         return (values, taus), state
 
     def means(self, out: tuple[jax.Array, jax.Array]) -> jax.Array:

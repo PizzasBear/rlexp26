@@ -93,7 +93,9 @@ def make_agent(
                 key=head_key,
             )
             returns = QuantileReturns(hp.iqn_train_samples, hp.iqn_huber_loss_k)
-            act_returns = QuantileReturns(hp.iqn_act_samples, hp.iqn_huber_loss_k)
+            act_returns = QuantileReturns(
+                hp.iqn_act_samples, hp.iqn_huber_loss_k, advantage_only=True
+            )
         case MXQ1() | MXQ2():
             cat = hp.categorical
             atoms = sinh_atoms(cat.cat_num_bins, cat.cat_asinh_bound)

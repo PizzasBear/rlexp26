@@ -1,5 +1,6 @@
 """
-The command lines: ``rlexp26`` starts a run and ``rlexp26-resume`` carries one on. Nothing
+The command lines: ``rlexp26`` starts a run, ``rlexp26-resume`` carries one on and
+``rlexp26-play`` watches one of its checkpoints play. Nothing
 here imports JAX, which reads its ``JAX_*`` settings from the environment once, at import: the
 loop is imported only after ``.env`` is loaded.
 """
@@ -9,7 +10,7 @@ import datetime as dt
 import json
 from fractions import Fraction
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import cappa
 import cattrs
@@ -39,6 +40,9 @@ class Run:
     seed: Annotated[int, Arg(default=Env("SEED"))] = 0
     # Environments stepped in lockstep: the batch the agent acts on.
     num_envs: Annotated[int, Arg(default=Env("NUM_ENVS"))] = 64
+    # Environments beside those, held out: the agent acts in them as in the rest, never
+    # learns from them, and scores its loss on them. Not counted in env_steps.
+    heldout_envs: Annotated[int, Arg(default=Env("HELDOUT_ENVS"))] = 8
     # The run stops at this many environment steps, over all environments.
     env_steps: Annotated[int, Arg(default=Env("ENV_STEPS"))] = 50_000_000
     # Gradient steps between policy handovers to the evaluator.
@@ -72,6 +76,20 @@ class Resume:
     profile: Annotated[tuple[int, int] | None, Arg(long=True)] = None
 
 
+@cappa.command(name="rlexp26-play")
+@dataclasses.dataclass(frozen=True)
+class Play:
+    """Watch a run's checkpoint play its game in a window, as its evaluation scores it."""
+
+    run: str
+    # The checkpoint's gradient step; the newest by default.
+    step: Annotated[int | None, Arg(long=True)] = None
+    # Stop after this many episodes; play until interrupted by default.
+    episodes: Annotated[int | None, Arg(long=True)] = None
+    # Seeds the game's no-op starts and the policy's draws.
+    seed: Annotated[int, Arg(long=True)] = 0
+
+
 # config.json is {"git": <git describe at the start>, "run": <the Run, but its profile>}, the
 # budget kept current by resumes. Unknown keys are refused, so a knob the code has since
 # dropped stops a resume instead of vanishing from it.
@@ -103,12 +121,11 @@ def main() -> None:
     )
 
 
-def resume() -> None:
-    load_dotenv(find_dotenv(usecwd=True))
-    args = cappa.parse(Resume)
-    config_path = LOG_ROOT / args.run / "config.json"
+def read_config(run_name: str) -> tuple[Path, dict[str, Any], Run]:
+    """The run's config.json: its path, its contents and the ``Run`` in it."""
+    config_path = LOG_ROOT / run_name / "config.json"
     if not config_path.exists():
-        raise SystemExit(f"no run {args.run!r}: {config_path} does not exist")
+        raise SystemExit(f"no run {run_name!r}: {config_path} does not exist")
     config = json.loads(config_path.read_text())
     try:
         run: Run = converter.structure(config["run"], Run)
@@ -121,6 +138,13 @@ def resume() -> None:
                 ]
             )
         ) from error
+    return config_path, config, run
+
+
+def resume() -> None:
+    load_dotenv(find_dotenv(usecwd=True))
+    args = cappa.parse(Resume)
+    config_path, config, run = read_config(args.run)
     if args.env_steps is not None:
         run = dataclasses.replace(run, env_steps=args.env_steps)
         config["run"] = converter.unstructure(run)
@@ -131,3 +155,14 @@ def resume() -> None:
     from .train import train
 
     train(run, args.run, resumed=True)
+
+
+def play() -> None:
+    load_dotenv(find_dotenv(usecwd=True))
+    args = cappa.parse(Play)
+    _config_path, _config, run = read_config(args.run)
+
+    # Only now: JAX reads its settings from the environment at import.
+    from .play import play
+
+    play(run, args.run, step=args.step, episodes=args.episodes, seed=args.seed)

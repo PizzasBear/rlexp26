@@ -90,7 +90,7 @@ def train(run: Run, run_name: str, *, resumed: bool) -> None:
         stop = stack.enter_context(stop_requested(signal.SIGINT, signal.SIGTERM))
         task = run.task
         env = stack.enter_context(
-            closing(task.make_env(run.num_envs, evaluation=False))
+            closing(task.make_env(run.num_envs + run.heldout_envs, evaluation=False))
         )
         # The one place the algorithm is named.
         agent: Agent = make_agent(
@@ -144,7 +144,12 @@ def train(run: Run, run_name: str, *, resumed: bool) -> None:
         tracker.log_hyperparameters(
             agent.hyperparameters
             | task.hyperparameters()
-            | {"run/seed": run.seed, "run/num_envs": run.num_envs, "run/git": git}
+            | {
+                "run/seed": run.seed,
+                "run/num_envs": run.num_envs,
+                "run/heldout_envs": run.heldout_envs,
+                "run/git": git,
+            }
         )
         # Seeded by where the run stands, so a resume plays new episodes, not the start's.
         # ALE's seeds are C ints, one per environment counting up from the one given.
@@ -165,22 +170,22 @@ def train(run: Run, run_name: str, *, resumed: bool) -> None:
         trace = None if run.profile is None else TraceWindow(logdir, *run.profile)
 
         obs, _info = env.reset(seed=env_seed)
-        agent.init(obs)
+        agent.init(obs, num_heldout=run.heldout_envs)
         # Under next-step autoreset, the step after an episode's end opens the next one.
-        episode_start = np.ones(run.num_envs, bool)
-        autoreset = np.zeros(run.num_envs, bool)
+        episode_start = np.ones(len(obs), bool)
+        autoreset = np.zeros(len(obs), bool)
         actions, extras = agent.act(
             obs, num_env_steps=num_env_steps, episode_start=episode_start
         )
         actions = jax.device_get(actions)
-        evaluator.submit(agent.policy())
+        evaluator.submit(agent.policy(num_env_steps=num_env_steps))
         last_eval_updates = agent.num_updates
 
         # A save's thread and event loop end only in its response's result(), which also
         # raises a failed save. should_save holds off while one is running, so the previous
         # save has finished by the next.
         saving: ocp.AsyncResponse[bool] | None = None
-        training_returns = np.zeros(run.num_envs)
+        training_returns = np.zeros(len(obs))
         eval_batch: list[EvalResult] = []
         last_log_time, last_log_env_steps = time.perf_counter(), num_env_steps
 
@@ -199,12 +204,17 @@ def train(run: Run, run_name: str, *, resumed: bool) -> None:
                 evaluator.advance()
 
                 training_returns += rewards
-                if (ended := task.episode_over(terminated, info) | truncated).any():
-                    tracker.log(
-                        {"run/training_returns": training_returns[ended].mean()},
-                        num_env_steps,
-                    )
-                    training_returns[ended] = 0.0
+                ended = task.episode_over(terminated, info) | truncated
+                for name, envs in (
+                    ("run/training_returns", slice(run.num_envs)),
+                    ("heldout/returns", slice(run.num_envs, None)),
+                ):
+                    if ended[envs].any():
+                        tracker.log(
+                            {name: training_returns[envs][ended[envs]].mean()},
+                            num_env_steps,
+                        )
+                training_returns[ended] = 0.0
                 tracker.drain(num_env_steps - STATS_DRAIN_LAG * run.num_envs)
 
                 agent.observe(
@@ -256,7 +266,7 @@ def train(run: Run, run_name: str, *, resumed: bool) -> None:
                     if trace is not None:
                         trace.update(agent)
                     if agent.num_updates - last_eval_updates >= run.eval_freq:
-                        evaluator.submit(agent.policy())
+                        evaluator.submit(agent.policy(num_env_steps=num_env_steps))
                         last_eval_updates = agent.num_updates
                     # Asked first, since gathering the checkpointables costs host time.
                     if checkpointer.should_save(agent.num_updates):

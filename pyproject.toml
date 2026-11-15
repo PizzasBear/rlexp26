@@ -26,7 +26,7 @@ dependencies = [
 [project.scripts]
 rlexp26 = "rlexp26.cli:main"
 rlexp26-resume = "rlexp26.cli:resume"
-rlexp26-play = "rlexp26.play:play"
+rlexp26-play = "rlexp26.cli:play"
 
 [project.optional-dependencies]
 # Nothing in the package imports envpool; its only user is ai-written-env-bench.py.bak, which
