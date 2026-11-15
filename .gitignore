@@ -15,5 +15,6 @@ wheels/
 .venv
 
 # Artifcats
+ale_roms
 checkpoints
 logs

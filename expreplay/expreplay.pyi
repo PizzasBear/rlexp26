@@ -1,240 +1,280 @@
 """
-A replay buffer for vectorised environments, with optional prioritised sampling.
+Experience replay for vectorised environments, as independent parts that agree on one thing: a
+handle names an observation by its environment and its timestep there.
 
-Every array is stored as ``[env, slot, ...]``: each of ``num_envs`` environments owns a circular
-buffer of ``env_capacity`` slots. Transitions are addressed by the flat index
-``env * env_capacity + slot``, which :meth:`ReplayBuffer.sample` returns and
-:meth:`ReplayBuffer.update_prios` takes back.
+- `Timeline` knows where episodes begin and end. It holds no data.
+- `Column` holds one field per timestep. It knows nothing of episodes.
+- `PrioTree` holds one weight per timestep and draws in proportion to them.
+- `Uniform` draws over everything a timeline has written.
 
-Successor observations are not stored: slot ``i`` reads its ``next_obs`` from slot ``i + 1``, and a
-frame stack reads backwards from ``i``. That halves the memory, at the cost of an unsamplable
-window around each write head.
+npt.NDArray[np.int64]
+-------
+A batch of handles is an ``int64`` array whose last axis is ``(env, t)``: ``t`` is the count of
+observations the environment had written before this one. A timestep is never reused for a
+different observation, so a handle stays meaningful after the ring has overwritten what it named,
+and every reader can tell that it has. The action taken from an observation and the reward it
+earned belong to the same handle; ``handles - (0, 1)`` is the timestep before.
 
-Episode boundaries come from :meth:`ReplayBuffer.save_step`'s ``terminated`` and ``truncated``
-flags, under Gymnasium's default ``AutoresetMode.NEXT_STEP``. :meth:`ReplayBuffer.reset` is only
-for the opening observation and for abandoning an episode by hand.
+Every method takes handles of any leading shape and answers in that shape.
 
-Only one frame is stored per slot; :meth:`ReplayBuffer.sample` reassembles the stack. Frames lead
-the observation shape, ``(num_envs, obs_stack, *obs_shape)``, so each is one contiguous memcpy; a
-model wanting them trailing transposes on the accelerator.
-
-Sampling is proportional to the values last passed to :meth:`ReplayBuffer.update_prios`, so a
-caller wanting ``p ** alpha`` applies ``alpha`` first. :meth:`ReplayBuffer.sample` returns the
-stored priorities unnormalised, leaving the importance-sampling denominator, and ``beta``, to the
-caller.
+Nothing here computes on a stored value. Returns, discounts and priorities are the caller's.
 """
 
-from typing import Any, Self
+import enum
+from typing import Any, final
 
 import numpy as np
 import numpy.typing as npt
 
-class ReplayBuffer:
+class EpisodeEnd(enum.Enum):
+    """What a rollout does on reaching the end of its episode."""
+
+    PAD = 0
+    """
+    Stay inside the episode: the steps past a terminal are padding. A truncation ends the rollout
+    only as its last step, so every rollout bootstraps after the same number of steps unless it
+    terminated.
+    """
+    CONTINUE = 1
+    """Run on into the following episodes, with `Rollout.kinds` marking each boundary."""
+
+class Kind(enum.IntEnum):
+    """What a timestep holds beyond its observation."""
+
+    STEP = 0
+    """A transition whose episode carries on into the next timestep."""
+    TERMINAL = 1
+    """A transition that ended its episode: nothing is bootstrapped past it."""
+    TRUNCATED = 2
+    """
+    A transition cut short by a time limit or a mid-run reset. The next timestep holds the
+    observation to bootstrap from.
+    """
+    FINAL = 3
+    """An observation with no action: the one an episode ended on."""
+
+@final
+class Span:
+    """
+    The stretch of timesteps a draw reads: ``length`` steps forward from the drawn handle, and
+    the ``stack - 1`` observations before it.
+    """
+
     def __new__(
-        cls,
-        num_envs: int,
-        env_capacity: int,
-        *,
-        obs_shape: tuple[int, ...],
-        obs_dtype: npt.DTypeLike = np.float32,
-        act_shape: tuple[int, ...] = (),
-        act_dtype: npt.DTypeLike = np.uint8,
-        obs_stack: int | None = None,
-        use_prios: bool = False,
-        max_prio: float = 1.0,
-        max_prio_decay: float = 0.999,
-        stratified: bool | None = None,
-        seed: int | None = None,
-    ) -> Self:
+        cls, length: int, *, stack: int = 1, episode_end: EpisodeEnd
+    ) -> Span: ...
+    @property
+    def length(self) -> int: ...
+    @property
+    def stack(self) -> int: ...
+    @property
+    def episode_end(self) -> EpisodeEnd: ...
+
+@final
+class Rollout:
+    """
+    The timesteps a batch of draws read, for gathering out of any `Column`. ``lead`` is the
+    leading shape of the handles it was made from.
+    """
+
+    @property
+    def steps(self) -> npt.NDArray[np.int64]:
         """
-        Allocate a buffer holding ``num_envs * env_capacity`` transitions.
-
-        ``obs_shape`` and ``act_shape`` describe one observation and action. Either dtype may be
-        ``uint8``, ``uint16``, ``uint32``, ``uint64``, ``int8``, ``int16``, ``int32``, ``int64``,
-        ``float16``, ``bfloat16``, ``float32`` or ``float64``; anything else raises ``TypeError``,
-        as does ``bfloat16`` where ``ml_dtypes`` has not registered it with ``numpy``.
-        :meth:`reset` and :meth:`save_step` take ``float16`` and ``bfloat16`` only as real
-        ``numpy`` arrays of that dtype.
-
-        ``obs_stack`` makes :meth:`sample` return that many consecutive frames per observation and
-        lets :meth:`save_step` take a stacked observation. It does not change the memory needed.
-
-        ``use_prios`` enables prioritised sampling. ``stratified`` splits the priority mass into
-        ``batch_size`` equal slices and takes one draw from each, which changes how the draws
-        correlate but not their marginal. It defaults to ``use_prios`` and requires it. A slice
-        holding nothing samplable is drawn from the whole mass instead.
-
-        ``max_prio`` seeds the priority new transitions are given, so a resumed run can refill at
-        the scale training reached. It must be finite and non-negative, and is read-only once the
-        buffer exists. See :meth:`update_prios` for ``max_prio_decay``, and :meth:`sample` for
-        n-step returns.
-
-        ``env_capacity`` must be at least three: the write head and the slot holding its
-        ``next_obs`` are always spoken for.
-
-        Raises ``MemoryError`` if the buffer does not fit, ``OverflowError`` if its flat index
-        would not fit in a ``uint32``, and ``ValueError`` for out-of-range parameters.
+        ``[*lead, length, 2]``: the transitions, in order. With `EpisodeEnd.PAD` the steps past a
+        terminal repeat it.
         """
-
-    def __len__(self) -> int:
+    @property
+    def frames(self) -> npt.NDArray[np.int64]:
         """
-        Number of transitions written, summed across environments. Includes the unsamplable
-        window around each write head, so it is more than :meth:`sample` can draw.
-        """
+        ``[*lead, stack + length, 2]``: one window of observations, oldest first, covering the
+        stack of every step and of the observation after the last. Observation ``j``'s stack is
+        elements ``j : j + stack``, to be sliced on the accelerator. Before the episode's start the
+        window repeats its first observation, and with `EpisodeEnd.PAD` it repeats the final one
+        past the end.
 
+        With `EpisodeEnd.CONTINUE` only the window's own start is held to its episode: a stack
+        that straddles a later boundary mixes two episodes, and `kinds` says where.
+        """
+    @property
+    def kinds(self) -> npt.NDArray[np.uint8]:
+        """``[*lead, length]``: the `Kind` of each of `steps`."""
+    @property
+    def lengths(self) -> npt.NDArray[np.uint32]:
+        """``[*lead]``: the real steps, short of ``length`` only where the episode terminated."""
+
+@final
+class Timeline:
+    """
+    The episode structure of ``num_envs`` environments, each a ring of ``env_capacity`` timesteps.
+
+    It follows Gymnasium's next-step autoreset: the step that ends an episode carries its final
+    observation, and the call after it carries the next episode's first observation with an
+    action and reward the environment ignored. That call completes no transition.
+    """
+
+    def __new__(cls, num_envs: int, env_capacity: int) -> Timeline: ...
     @property
     def num_envs(self) -> int: ...
     @property
     def env_capacity(self) -> int: ...
     @property
-    def total_capacity(self) -> int: ...
-    @property
-    def obs_dtype(self) -> np.dtype: ...
-    @property
-    def obs_shape(self) -> tuple[int, ...]: ...
-    @property
-    def act_dtype(self) -> np.dtype: ...
-    @property
-    def act_shape(self) -> tuple[int, ...]: ...
-    @property
-    def obs_stack(self) -> int | None:
-        """Frames per observation that :meth:`sample` returns, or ``None`` without a stack."""
-
-    @property
-    def use_prios(self) -> bool: ...
-    @property
-    def stratified(self) -> bool:
+    def newest(self) -> npt.NDArray[np.int64]:
         """
-        Whether a prioritised batch is spread over the priority mass rather than drawn
-        independently. Settable, since it changes nothing stored; setting it on a buffer built
-        without ``use_prios`` raises ``ValueError``.
+        ``[num_envs]``: each environment's newest written timestep, -1 before its first. A
+        timestep's age is its distance behind this.
         """
-
-    @stratified.setter
-    def stratified(self, value: bool) -> None: ...
-    @property
-    def max_prio(self) -> float:
+    def reset(self) -> npt.NDArray[np.int64]:
         """
-        The priority a newly written transition is given (see :meth:`update_prios`), and so the
-        denominator of an importance-sampling weight normalised against the whole buffer.
+        Starts an episode in every environment and returns the handles, ``[num_envs, 2]``, their
+        opening observations take.
 
-        Not settable, unlike :attr:`max_prio_decay`: every stored priority was written against the
-        value in force at the time.
+        Normally called once: autoreset boundaries come from `step`'s flags. Called mid-run it
+        abandons the current episodes. The newest observation is then the one the transition
+        before it bootstraps from, so that transition becomes a truncation and the new episode
+        starts a timestep later. A newest observation no transition leads to is overwritten
+        instead, and its handle is handed out again.
         """
-
-    @property
-    def max_prio_decay(self) -> float:
+    def step(
+        self, terminated: npt.NDArray[np.bool_], truncated: npt.NDArray[np.bool_]
+    ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.bool_]]:
         """
-        How fast :attr:`max_prio` decays, once per :meth:`update_prios` call, so its half-life is
-        in gradient steps. Settable; raises ``ValueError`` outside ``(0, 1]``.
+        Records one environment step each and returns ``(obs, stepped)``: the handles,
+        ``[num_envs, 2]``, the incoming observations take, and a ``[num_envs]`` mask.
+
+        Where ``stepped`` is set, the call completed the transition at ``obs - (0, 1)``, and its
+        action and reward belong there. It is clear on the call after an episode's end, whose
+        action and reward the environment ignored.
         """
-
-    @max_prio_decay.setter
-    def max_prio_decay(self, value: float) -> None: ...
-    def reset(self, obs: npt.NDArray[Any]) -> None:
+    def valid(
+        self, handles: npt.NDArray[np.int64], span: Span
+    ) -> npt.NDArray[np.bool_]:
         """
-        Seed every environment with its initial observation.
+        Whether a draw of ``span`` may start at each handle: the one rule every sampler rejects by.
 
-        ``obs`` is ``(num_envs, *obs_shape)``, or ``(num_envs, obs_stack, *obs_shape)`` of which
-        only the newest (last) frame is kept, and already in the buffer's dtype; nothing is cast.
+        The handle must be live, and so must the ``stack - 1`` observations before it, back to the
+        start of its episode at the furthest. An episode's start is read off the timestep before
+        it, so that one must be live as well. With `EpisodeEnd.PAD` the handle must be a
+        transition, and the rollout must reach its last step or a terminal without meeting the
+        newest observation or a truncation with steps to go. With `EpisodeEnd.CONTINUE` the
+        ``length`` timesteps after it must all be written.
+        """
+    def rollout(self, handles: npt.NDArray[np.int64], span: Span) -> Rollout:
+        """
+        The timesteps each draw of ``span`` reads, in the leading shape of ``handles``.
 
-        Normally called once: autoreset boundaries come from :meth:`save_step`'s flags. Called
-        mid-run it abandons the current episode, as ``gym.Env.reset`` does. The head's observation
-        is the ``next_obs`` of the transition before it, so where that transition is mid-episode it
-        is closed off as a truncation and the new episode starts one slot later. Otherwise the
-        head is overwritten and no slot is spent.
-
-        Raises ``TypeError`` on a dtype mismatch and ``ValueError`` on a shape mismatch, before
-        anything is written.
+        Raises `ValueError` on a start that `valid` refuses.
         """
 
-    def save_step(
-        self,
-        actions: npt.NDArray[Any],
-        rewards: npt.NDArray[np.float32],
-        terminated: npt.NDArray[np.bool],
-        truncated: npt.NDArray[np.bool],
-        next_obs: npt.NDArray[Any],
-    ) -> None:
-        """
-        Record one transition per environment and advance each write head.
+@final
+class Column:
+    """
+    A field stored per timestep, in a ring of ``env_capacity`` timesteps per environment. A row is
+    ``shape`` elements of ``dtype``, which may be any NumPy dtype without Python objects.
 
-        Every argument is indexed by environment, and ``next_obs`` takes the shapes ``obs`` does in
-        :meth:`reset`. Where ``terminated`` or ``truncated`` is set it is the episode's final
-        observation. The call after that carries the new episode's first observation with an
-        action and reward the environment ignored; it completes no transition and does not grow
-        ``len(self)``.
+    A column follows its own writes and no timeline, so it can hold a field written on some other
+    schedule, such as a recurrent state written back after training. Reads and writes release the
+    GIL.
 
-        Raises ``TypeError`` on a dtype mismatch and ``ValueError`` on a shape mismatch, before
-        anything is written.
-        """
+    Raises `MemoryError` where the storage cannot be allocated.
+    """
 
-    def sample(
-        self,
-        batch_size: int,
+    def __new__(
+        cls,
+        num_envs: int,
+        env_capacity: int,
         *,
-        n_steps: int = 1,
-        discount: float | None = None,
-    ) -> tuple[
-        npt.NDArray[np.uint32],  # indices
-        npt.NDArray[np.float32],  # prios
-        npt.NDArray[Any],  # obs
-        npt.NDArray[Any],  # act
-        npt.NDArray[np.float32],  # rewards
-        npt.NDArray[np.bool],  # terminals
-        npt.NDArray[Any],  # next_obs
-    ]:
-        """
-        Draw ``batch_size`` transitions.
-
-        ``obs`` and ``next_obs`` are ``(batch_size, obs_stack, *obs_shape)``, or
-        ``(batch_size, *obs_shape)`` without a frame stack, frames oldest first. A stack reaching
-        past an episode's start repeats its oldest frame, as a frame-stack wrapper does. ``act`` is
-        ``(batch_size, *act_shape)`` and the rest are ``(batch_size,)``.
-
-        ``indices`` go back to :meth:`update_prios`. ``prios`` are the stored priorities,
-        unnormalised, and ``1.0`` throughout without priorities: :attr:`sum_prios` turns them into
-        sampling probabilities, :attr:`max_prio` into a buffer-wide weight. Transitions too close
-        to a write head are redrawn, which leaves the priorities untouched.
-
-        ``rewards`` is the ``n_steps`` return and ``next_obs`` the observation ``n_steps`` later,
-        or where the episode ended if sooner. ``terminals`` marks true episode ends only, since a
-        time-limit truncation is still bootstrapped from. A rollout meeting a truncation before
-        its ``n_steps`` are up is redrawn, since the caller applies one ``discount ** n_steps`` to
-        the whole batch.
-
-        Raises ``ValueError`` if ``discount`` is missing or out of range, ``batch_size`` is zero,
-        or nothing can be drawn yet, and ``RuntimeError`` if the priorities have collapsed onto
-        slots that cannot be drawn.
-        """
-
-    def update_prios(
-        self,
-        indices: npt.NDArray[np.uint32],
-        prios: npt.NDArray[np.float32],
-    ) -> None:
-        """
-        Replace the priorities at ``indices`` with ``prios``.
-
-        Both arrays must be the same length and the priorities finite and non-negative. The whole
-        batch is checked first, so a bad one leaves the buffer untouched. The last value for a
-        duplicate index wins. No exponent is applied.
-
-        Also sets :attr:`max_prio` to the larger of the highest value in ``prios`` and its
-        previous value times ``max_prio_decay``. A running maximum would keep handing new
-        transitions the priority of early training's large TD errors.
-
-        Pass real ``numpy`` arrays of exactly these dtypes: anything else is converted element by
-        element, which costs far more than the update.
-
-        Raises ``ValueError`` if the buffer was built without priorities or a priority is invalid,
-        and ``IndexError`` if an index is out of range.
-        """
-
+        dtype: npt.DTypeLike,
+        shape: tuple[int, ...] = (),
+    ) -> Column: ...
     @property
-    def sum_prios(self) -> float:
+    def num_envs(self) -> int: ...
+    @property
+    def env_capacity(self) -> int: ...
+    @property
+    def dtype(self) -> np.dtype[Any]: ...
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+    def write(
+        self, handles: npt.NDArray[np.int64], values: npt.NDArray[Any]
+    ) -> npt.NDArray[np.bool_]:
         """
-        Sum of every stored priority, which turns :meth:`sample`'s priorities into probabilities.
+        Writes ``values``, of shape ``[*handles.shape[:-1], *shape]``, one row per handle and in
+        order, and returns which landed.
 
-        Raises ``ValueError`` if the buffer was built without priorities.
+        A handle the ring has moved past is skipped: a value computed from a draw may arrive after
+        its timestep was overwritten. A handle beyond the newest timestep moves the ring up to it,
+        zeroing the timesteps in between.
+
+        ``values`` must already be an array of the column's dtype, or it is a `TypeError`: nothing
+        is cast on the way in.
+        """
+    def read(self, handles: npt.NDArray[np.int64]) -> npt.NDArray[Any]:
+        """
+        The row at each handle, as ``[*handles.shape[:-1], *shape]``.
+
+        Raises `IndexError` on a handle the column no longer holds, or does not hold yet.
+        """
+
+@final
+class PrioTree:
+    """
+    A weight per timestep, in a ring of ``env_capacity`` per environment, with a sum tree over
+    them.
+
+    It is a column of weights and follows its own writes, as `Column` does. What a weight means
+    is the caller's: a priority, a priority scaled by age, or one for a uniform draw. A timestep
+    with no weight written is never drawn, so the caller writes one as each transition completes.
+    """
+
+    def __new__(
+        cls, num_envs: int, env_capacity: int, *, seed: int | None = None
+    ) -> PrioTree: ...
+    @property
+    def num_envs(self) -> int: ...
+    @property
+    def env_capacity(self) -> int: ...
+    @property
+    def total(self) -> float:
+        """The sum of every weight. A draw's probability is its weight over this."""
+    def write(
+        self, handles: npt.NDArray[np.int64], weights: npt.NDArray[np.float32]
+    ) -> npt.NDArray[np.bool_]:
+        """
+        Sets the weight at each handle, in order, and returns which landed.
+
+        Stale and skipped handles are treated as `Column.write` treats them, a skipped timestep's
+        weight being zero. A weight that is not finite and non-negative is a `ValueError`, raised
+        before anything is written.
+        """
+    def read(self, handles: npt.NDArray[np.int64]) -> npt.NDArray[np.float32]:
+        """The weight at each handle. Raises `IndexError` as `Column.read` does."""
+    def sample(
+        self, batch: int, timeline: Timeline, span: Span, *, stratified: bool = False
+    ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.float32]]:
+        """
+        Draws ``batch`` handles with replacement, in proportion to weight among those ``span`` can
+        start at on ``timeline``, and returns ``(handles, weights)``: ``[batch, 2]`` and each
+        one's weight.
+
+        ``stratified`` cuts the weight mass into ``batch`` equal slices and draws one handle from
+        each, falling back to the whole mass for a slice that keeps proposing invalid handles.
+
+        Raises `RuntimeError` when every weight is zero, or when a draw gives up: nearly all the
+        weight then sits on timesteps the span cannot start at.
+        """
+
+@final
+class Uniform:
+    """Draws over every timestep a timeline holds, equally likely."""
+
+    def __new__(cls, *, seed: int | None = None) -> Uniform: ...
+    def sample(
+        self, batch: int, timeline: Timeline, span: Span
+    ) -> npt.NDArray[np.int64]:
+        """
+        Draws ``batch`` handles, ``[batch, 2]``, uniformly and with replacement over those
+        ``span`` can start at on ``timeline``.
+
+        Raises `RuntimeError` when a draw gives up: the timeline is empty, or too young for the
+        span.
         """

@@ -9,26 +9,31 @@ license-files = ["LICENSE.txt"]
 authors = [{ name = "Max S.", email = "gmx.sht@gmail.com" }]
 dependencies = [
     "ale-py>=0.12.1",
+    "cappa>=0.33.0",
+    "cattrs>=26.2.1",
     "crc32c>=2.9",  # for tensorboardX
+    "equinox>=0.13.8",
     "expreplay",
-    "flax>=0.12.9",
     "gymnasium[box2d,mujoco,other]==1.3.0",
     "jax>=0.11.1",
+    "jaxtyping>=0.3.11",
     "optax>=0.2.8",
     "orbax-checkpoint>=0.12.4",
+    "python-dotenv>=1.2.3",
     "tensorboardX>=2.6.5",
 ]
 
 [project.scripts]
-rlexp26 = "rlexp26:main"
+rlexp26 = "rlexp26.cli:main"
+rlexp26-resume = "rlexp26.cli:resume"
 rlexp26-play = "rlexp26.play:play"
 
 [project.optional-dependencies]
-cuda13 = ["jax[cuda13]"]
 # Nothing in the package imports envpool; its only user is ai-written-env-bench.py.bak, which
 # already prints "(envpool not installed)" and carries on without it. Kept as an extra rather
 # than dropped until the ALE-vs-envpool throughput question is actually settled.
 bench = ["envpool>=1.2.5"]
+cuda13 = ["jax[cuda13]"]
 
 [dependency-groups]
 dev = [
@@ -46,29 +51,28 @@ build-backend = "uv_build"
 
 [tool.mypy]
 strict = true
+packages = ["rlexp26", "expreplay", "expreplay.tests"]
 
 # These ship no py.typed; the notes otherwise bury real errors.
 [[tool.mypy.overrides]]
 module = ["optax.*", "etils.*", "orbax.*", "tensorboard.*", "tensorboardX.*"]
 ignore_missing_imports = true
 
-# Vendored Flax primitives -- kept diffable against upstream, so not annotated.
+# Vendored Equinox -- kept diffable against upstream, so not annotated.
 [[tool.mypy.overrides]]
-module = ["rlexp26.internals"]
+module = ["rlexp26.modules.vendored.*"]
 ignore_errors = true
 
 [tool.pyright]
 venv = ".venv"
 venvPath = "."
 typeCheckingMode = "basic"
-# Vendored Flax primitives -- kept diffable against upstream, so not annotated.
-# Both reports are upstream's own: scale_init(rngs["params"], ...) and the
-# unnarrowed Optional[dict] scales.
-ignore = ["src/rlexp26/internals.py"]
+# Vendored Equinox -- kept diffable against upstream, so not annotated.
+ignore = ["src/rlexp26/modules/vendored/*.py"]
 
 [tool.ruff.lint.per-file-ignores]
-# Vendored Flax primitives -- kept diffable against upstream, so not restyled.
-"src/rlexp26/internals.py" = ["UP006", "UP045", "B008"]
+# Vendored Equinox -- kept diffable against upstream, so not restyled.
+"src/rlexp26/modules/vendored/*.py" = ["I001", "PLR0402", "UP046", "RUF100"]
 
 [tool.uv.sources]
 expreplay = { workspace = true }

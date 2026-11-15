@@ -3,8 +3,14 @@ is learning, and nothing about how it learns.
 
 The loop owns the environment, the clock, the writer and the checkpoints. The agent owns its
 networks, its optimizer and its own memory -- a replay buffer, a rollout buffer, or nothing at
-all -- so what a transition has to carry and when a gradient step is worth taking are its
-decisions rather than the loop's."""
+all -- so what a timestep has to carry and when a gradient step is worth taking are its
+decisions rather than the loop's.
+
+Nothing here names a kind of environment. Observations and actions are PyTrees of arrays whose
+leaves lead with the environment axis: one array for a ``Box`` or a ``Discrete`` space, a dict
+of them for a ``Dict``. An agent is built from the environment's spaces and says there what it
+supports.
+"""
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
@@ -13,69 +19,65 @@ from typing import Any, NamedTuple
 import jax
 import numpy as np
 import numpy.typing as npt
+from jaxtyping import PyTree
 
 
 class EnvStep(NamedTuple):
     """
-    One step of every environment, host-side, indexed by environment throughout.
+    What every environment answered to one batch of actions, host-side, indexed by environment
+    throughout. The observations the actions were chosen from are the previous step's
+    ``next_obs``, or ``Agent.init``'s.
 
-    ``extras`` is what ``act`` returned alongside the actions, transferred and handed straight
-    back: the loop never looks inside it, so an agent that needs the behaviour policy's
-    log-probability or a value estimate at training time can put it there and read it here.
+    ``extras`` is what ``act`` returned alongside the actions, handed straight back and still on
+    the device: the loop neither reads nor transfers it. It is the agent's channel from the
+    moment it acted to the moment it stores: the behaviour policy's log-probability, a value
+    estimate, the recurrent state it acted from, a latent of the observation.
 
-    Under Gymnasium's next-step autoreset the step *after* a termination carries the new
-    episode's first observation with an action and a reward the environment ignored, and
-    completes no transition.
+    ``info`` is the environment's, untouched: what a task says beyond its reward.
+
+    Under Gymnasium's next-step autoreset the step *after* an episode's end carries the new
+    episode's first observation with actions and rewards the environment ignored, and completes
+    no transition. Its ``extras`` still describe a real observation: the one the episode ended
+    on.
     """
 
-    obs: npt.NDArray[Any]  # what the actions were chosen from
-    actions: npt.NDArray[Any]
-    rewards: npt.NDArray[Any]
+    actions: PyTree[npt.NDArray[Any]]
+    rewards: npt.NDArray[np.floating[Any]]
     terminated: npt.NDArray[np.bool_]
     truncated: npt.NDArray[np.bool_]
-    next_obs: npt.NDArray[Any]
-    extras: dict[str, npt.NDArray[Any]]
+    next_obs: PyTree[npt.NDArray[Any]]
+    info: Mapping[str, Any]
+    extras: PyTree[jax.Array]
 
 
 class Policy(ABC):
     """
-    An agent's behaviour, detached from its training: weights in, actions out.
+    An agent's acting weights at one moment, as the policy a score is reported under rather
+    than the one that collects experience. Immutable and safe to hand to another thread.
 
-    Built once and reloaded, so the evaluator keeps one network alive across snapshots.
+    Whatever acting carries from one step to the next -- a random key, a recurrent state -- is
+    in the ``state`` the caller threads through ``act``, not in the policy. So a newer snapshot
+    of the same agent takes over mid-episode on the state the older one left.
     """
 
     @abstractmethod
-    def checkpointables(self) -> dict[str, Any]:
-        """
-        The subset of a run's checkpoint this policy can be filled from, keyed for orbax, and
-        the abstract state that subset is read into. The keys are the agent's own, so a policy
-        loads either from ``Agent.policy_weights`` in memory or straight out of a checkpoint on
-        disk, and only the algorithm ever names them.
-        """
-
-    @abstractmethod
-    def load(self, weights: Mapping[str, Any], *, seed: int) -> None:
-        """
-        Fill this policy from the entries ``checkpointables`` names -- a live snapshot out of
-        ``Agent.policy_weights``, or what orbax read back into that same tree -- and restart its
-        own randomness at ``seed``, so that successive loads of different weights replay the
-        same draws.
-        """
+    def initial_state(self, num_envs: int, *, key: jax.Array) -> PyTree[jax.Array]:
+        """The state to act from before any observation, for this many environments."""
 
     @abstractmethod
     def act(
-        self, obs: npt.NDArray[Any], *, num_env_steps: int, evaluation: bool = False
-    ) -> tuple[jax.Array, dict[str, jax.Array]]:
+        self,
+        obs: PyTree[npt.NDArray[Any]],
+        state: PyTree[jax.Array],
+        *,
+        episode_start: npt.NDArray[np.bool_],
+    ) -> tuple[PyTree[jax.Array], PyTree[jax.Array]]:
         """
-        One action per environment, still on the device.
+        One action per environment and the state to pass to the next call, both still on the
+        device.
 
-        ``num_env_steps`` is the run's step count, which is what an agent whose exploration is
-        scheduled reads its schedule from. ``evaluation`` asks for the policy a score should be
-        reported under rather than the one that collects experience.
-
-        The second return is whatever the agent wants said about the actions it just took, keyed
-        by a plain name. The run logs each entry as ``run/action_<name>``, averaged over its
-        logging window, and hands the whole dict back in the ``EnvStep``.
+        ``episode_start`` marks the environments whose ``obs`` opens an episode; whatever
+        ``state`` carries across steps is started afresh there.
         """
 
 
@@ -85,8 +87,9 @@ class Agent(ABC):
     steps -- target networks, moments, exploration schedules -- all kept inside itself.
 
     The run drives it in one order and only that order: ``init`` once, then ``act`` /
-    ``observe`` / ``learn_step`` per iteration. ``restore`` comes before ``init``, so that an
-    agent whose memory is sized or seeded from the checkpoint can build it knowing both.
+    ``observe`` / ``learn_step`` per iteration, with the ``act`` on a step's ``next_obs``
+    dispatched before that step is observed. ``restore`` comes before ``init``, so that an agent
+    whose memory is sized or seeded from the checkpoint can build it knowing both.
     """
 
     @property
@@ -108,18 +111,29 @@ class Agent(ABC):
         """
 
     @abstractmethod
-    def init(self, obs: npt.NDArray[Any]) -> None:
+    def init(self, obs: PyTree[npt.NDArray[Any]]) -> None:
         """
-        The environments' first observations, before any action is taken. An agent that stores
-        transitions needs this as the ``obs`` half of the first one; the shapes and dtypes it
-        sizes its memory from are here too.
+        The environments' first observations, before any action is taken: the number of
+        environments is their leading axis.
         """
 
     @abstractmethod
     def act(
-        self, obs: npt.NDArray[Any], *, num_env_steps: int, evaluation: bool = False
-    ) -> tuple[jax.Array, dict[str, jax.Array]]:
-        """As ``Policy.act``, on the agent's own acting weights."""
+        self,
+        obs: PyTree[npt.NDArray[Any]],
+        *,
+        num_env_steps: int,
+        episode_start: npt.NDArray[np.bool_],
+    ) -> tuple[PyTree[jax.Array], PyTree[jax.Array]]:
+        """
+        One action per environment from the policy that collects experience, and the ``extras``
+        the matching ``EnvStep`` hands back, both still on the device. The run transfers the
+        actions and leaves the extras where they are.
+
+        ``num_env_steps`` is the run's step count, which is what an agent whose exploration is
+        scheduled reads its schedule from. ``episode_start`` marks the environments whose
+        ``obs`` opens an episode, where a state carried across steps starts afresh.
+        """
 
     @abstractmethod
     def observe(self, step: EnvStep) -> None:
@@ -144,25 +158,14 @@ class Agent(ABC):
     @abstractmethod
     def stats(self) -> dict[str, float]:
         """
-        Scalars describing the agent's own state rather than a gradient step's, read on the run's
-        logging cadence and written under the names given. Cheap: this is called whether or not
-        the agent has learned anything.
+        Scalars describing the agent's own state rather than a gradient step's -- its memory,
+        the actions it has been taking -- read on the run's logging cadence and written under
+        the names given. Cheap: this is called whether or not the agent has learned anything.
         """
 
     @abstractmethod
-    def policy_weights(self) -> dict[str, Any]:
-        """
-        A snapshot of the acting weights, detached from further updates, for a ``Policy`` on
-        another thread to load. Keyed as ``Policy.checkpointables`` describes, which is what
-        lets the one ``load`` serve both a live handover and a restore from disk.
-        """
-
-    @abstractmethod
-    def make_policy(self) -> Policy:
-        """
-        An empty policy shaped like this agent's, to be filled by ``Policy.load``. Called on the
-        thread that will act with it, since it builds a network.
-        """
+    def policy(self) -> Policy:
+        """The acting weights as they stand, detached from further updates."""
 
     @abstractmethod
     def checkpointables(self) -> dict[str, Any]:

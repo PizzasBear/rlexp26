@@ -1,323 +1,265 @@
-use thiserror::Error;
+//! [`PrioTree`]: one weight per timestep, drawn in proportion.
 
-use crate::utils::{AllocationError, try_zeroed_vec};
+use rand::prelude::*;
+use rand::rngs::Xoshiro256PlusPlus;
 
-#[derive(Debug, Error)]
-pub enum UpdateError {
-    #[error("Supplied invalid priority value {0:?}")]
-    InvalidPrio(f32),
-    #[error("Failed to index priority tree")]
-    IndexError,
-}
+use crate::column::check_len;
+use crate::ring::Ring;
+use crate::sampling::{STRATIFIED_ATTEMPTS, fill};
+use crate::sum_tree::SumTree;
+use crate::{Error, Handle, Span, Timeline};
 
-#[derive(Debug, Error)]
-#[error("Sample larger than tree size")]
-pub struct SampleError(());
-
-/// A sum tree over `len` priorities, with O(log n) point update and O(log n) sampling
-/// proportional to priority.
-///
-/// A segment tree, not a Fenwick tree: every internal node is re-derived from its two children
-/// on update rather than adjusted by a delta, so the total's relative error stays around
-/// `log2(len) * f32::EPSILON` however many updates go through it.
-///
-/// # Layout
-///
-/// `data` is an implicit binary heap of `2 * len - 1` nodes: the root is `0`, the children of `i`
-/// are `2i + 1` and `2i + 2`, and each node holds its subtree's sum. The length is odd, so node
-/// `i` has children exactly when `i < offset()`, and the last `len` nodes are the leaves, in
-/// order. This works for any `len`.
-///
-/// # Sampling invariant
-///
-/// [`sample`](Self::sample) descends maintaining `sample < subtree total`, which keeps it off
-/// zero-priority leaves. Hence the half-open `[0, total)`.
+/// A column of weights with a sum tree over it. A timestep with no weight written is never
+/// drawn.
 pub struct PrioTree {
-    data: Box<[f32]>,
+    ring: Ring,
+    tree: SumTree,
+    rng: Xoshiro256PlusPlus,
 }
 
 impl PrioTree {
-    pub fn new(len: usize) -> Result<Self, AllocationError> {
-        if usize::MAX / 4 <= len {
-            return Err(AllocationError::new());
-        }
-        let data_len = (2 * len).saturating_sub(1);
-        let data = try_zeroed_vec(data_len)?.into_boxed_slice();
+    pub fn new(num_envs: usize, env_capacity: usize, seed: Option<u64>) -> Result<Self, Error> {
+        let ring = Ring::new(num_envs, env_capacity)?;
+        let tree = SumTree::new(ring.len())?;
 
-        Ok(Self { data })
+        Ok(Self {
+            ring,
+            tree,
+            rng: match seed {
+                Some(seed) => Xoshiro256PlusPlus::seed_from_u64(seed),
+                None => rand::make_rng(),
+            },
+        })
     }
 
-    /// Index of the first leaf, i.e. the number of internal nodes.
-    #[inline]
-    pub fn offset(&self) -> usize {
-        self.data.len() / 2
+    pub fn num_envs(&self) -> usize {
+        self.ring.num_envs()
     }
 
-    /// Number of priorities the tree holds.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.data.len().div_ceil(2)
+    pub fn env_capacity(&self) -> usize {
+        self.ring.env_capacity()
     }
 
-    /// Sum of every priority, and the exclusive upper bound for [`sample`](Self::sample).
-    #[inline]
+    /// The sum of every weight. A draw's probability is its weight over this.
     pub fn total(&self) -> f32 {
-        *self.data.first().unwrap_or(&0.)
+        self.tree.total()
     }
 
-    /// The priorities themselves, in index order.
-    #[inline]
-    #[cfg(test)]
-    pub fn prios(&self) -> &[f32] {
-        &self.data[self.offset()..]
-    }
-
-    /// Sets the priority at `i`, repairing every node on the path back to the root.
+    /// Sets the weight at each handle, as [`Column::write`](crate::Column::write) does.
     ///
-    /// `value` must be finite and non-negative; zero is allowed and makes the entry unsamplable.
-    pub fn update(&mut self, mut i: usize, value: f32) -> Result<(), UpdateError> {
-        if self.len() <= i {
-            return Err(UpdateError::IndexError);
+    /// Weights must be finite and non-negative, checked before anything is written.
+    pub fn write(
+        &mut self,
+        handles: &[Handle],
+        weights: &[f32],
+        mut landed: Option<&mut [bool]>,
+    ) -> Result<usize, Error> {
+        check_len("weights", weights.len(), handles.len())?;
+        if let Some(landed) = &landed {
+            check_len("landed", landed.len(), handles.len())?;
         }
-        if value < 0.0 || !value.is_finite() {
-            return Err(UpdateError::InvalidPrio(value));
-        }
-
-        i += self.offset();
-        self.data[i] = value;
-        while 0 < i {
-            let parent = (i - 1) / 2;
-            let sibling = ((i + 1) ^ 1) - 1;
-            self.data[parent] = self.data[i] + self.data[sibling];
-            i = parent;
-        }
-        Ok(())
-    }
-
-    /// Maps a point in `[0, total())` to the index whose priority interval contains it, and that
-    /// index's priority. Uniform points sample proportionally to priority.
-    ///
-    /// The invariant survives rounding in the node totals: a point strictly below a node's total
-    /// is at least an ulp below it, so `sample - left` cannot round up to the right child's total.
-    pub fn sample(&self, mut sample: f32) -> Result<(usize, f32), SampleError> {
-        if self.total() == 0.0 || !(0.0 <= sample && sample < self.total()) {
-            return Err(SampleError(()));
+        if let Some(&weight) = weights.iter().find(|w| !(0.0 <= **w && w.is_finite())) {
+            return Err(Error::InvalidWeight(weight));
         }
 
-        let mut i = 0;
-        loop {
-            let left = 2 * i + 1;
-            let Some(&left_total) = self.data.get(left) else {
-                break;
+        let mut count = 0;
+        for (i, (&handle, &weight)) in handles.iter().zip(weights).enumerate() {
+            let claim = self.ring.claim(handle)?;
+            if let Some(landed) = &mut landed {
+                landed[i] = claim.is_some();
+            }
+            let Some((row, skipped)) = claim else {
+                continue;
             };
 
-            if sample < left_total {
-                i = left;
-            } else {
-                sample -= left_total;
-                i = left + 1;
+            for skipped in skipped {
+                self.tree.update(skipped, 0.0).expect("row in range");
+            }
+            self.tree
+                .update(row, weight)
+                .expect("row in range, weight checked");
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    /// The weight at each handle. Fails as [`Column::read`](crate::Column::read) does.
+    pub fn read(&self, handles: &[Handle]) -> Result<Vec<f32>, Error> {
+        (handles.iter())
+            .map(|&handle| Ok(self.tree.prios()[self.ring.locate(handle)?]))
+            .collect()
+    }
+
+    /// Draws `batch` handles with replacement, in proportion to weight among those `span` can
+    /// start at on `timeline`, with each one's weight. `stratified` draws one handle from each
+    /// of `batch` equal slices of the weight mass.
+    pub fn sample(
+        &mut self,
+        batch: usize,
+        timeline: &Timeline,
+        span: &Span,
+        stratified: bool,
+    ) -> Result<(Vec<Handle>, Vec<f32>), Error> {
+        let total = self.tree.total();
+        if total <= 0.0 {
+            return Err(Error::NoWeight);
+        }
+
+        let handles = fill(
+            batch,
+            |k, attempt| {
+                // A fraction of the total, not a sub-range of it: at a tiny total, consecutive
+                // slice bounds round together.
+                let fraction = if stratified && attempt < STRATIFIED_ATTEMPTS {
+                    (k as f32 + self.rng.random::<f32>()) / batch as f32
+                } else {
+                    self.rng.random::<f32>()
+                };
+
+                // The product can round up to `total`, which the half-open range refuses.
+                let point = (fraction * total).min(total.next_down());
+                let (row, _) = self.tree.sample(point).ok()?;
+                self.ring.handle_at(row)
+            },
+            |handle| timeline.valid(handle, span),
+        )?;
+        let weights = self
+            .read(&handles)
+            .expect("drawn handles are live in the tree");
+
+        Ok((handles, weights))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::EpisodeEnd;
+
+    use super::*;
+
+    fn handle(env: u64, t: u64) -> Handle {
+        Handle { env, t }
+    }
+
+    /// One environment, `steps` transitions into a single episode, and a tree weighting each.
+    fn stepped(capacity: usize, steps: u64, weight: impl Fn(u64) -> f32) -> (Timeline, PrioTree) {
+        let mut timeline = Timeline::new(1, capacity).unwrap();
+        let mut tree = PrioTree::new(1, capacity, Some(0)).unwrap();
+        let (mut obs, mut done) = ([handle(0, 0)], [false]);
+
+        timeline.reset(&mut obs).unwrap();
+        for _ in 0..steps {
+            timeline
+                .step(&[false], &[false], &mut obs, &mut done)
+                .unwrap();
+            let t = obs[0].t - 1;
+            tree.write(&[handle(0, t)], &[weight(t)], None).unwrap();
+        }
+
+        (timeline, tree)
+    }
+
+    #[test]
+    fn test_prio_tree_draws_in_proportion_to_weight() {
+        let (timeline, mut tree) = stepped(8, 4, |t| (t + 1) as f32);
+        let span = Span::new(1, 1, EpisodeEnd::Pad).unwrap();
+        assert_eq!(tree.total(), 10.0);
+
+        for stratified in [false, true] {
+            let (handles, weights) = tree.sample(10_000, &timeline, &span, stratified).unwrap();
+            let mut counts = [0; 4];
+            for (handle, weight) in handles.iter().zip(weights) {
+                assert_eq!(weight, (handle.t + 1) as f32);
+                counts[handle.t as usize] += 1;
+            }
+            for (t, count) in counts.into_iter().enumerate() {
+                let expected = 1_000 * (t as i32 + 1);
+                let slack = if stratified { 1 } else { 150 };
+                assert!(
+                    (count - expected).abs() <= slack,
+                    "{counts:?}, stratified {stratified}"
+                );
             }
         }
-
-        Ok((i - self.offset(), self.data[i]))
     }
-}
 
-#[test]
-fn test_prio_tree_basic() {
-    // Test zero size works
-    assert_eq!(PrioTree::new(0).unwrap().len(), 0);
+    #[test]
+    fn test_prio_tree_keeps_only_what_the_timeline_accepts() {
+        // The newest two transitions cannot start a three-step rollout, whatever they weigh.
+        let (timeline, mut tree) = stepped(16, 6, |t| if t < 4 { 1.0 } else { 4.0 });
+        let span = Span::new(3, 1, EpisodeEnd::Pad).unwrap();
 
-    // Test sample, update & total
-    let mut tree = PrioTree::new(3).unwrap();
-    assert_eq!(tree.len(), 3);
-    assert_eq!(tree.total(), 0.0);
-
-    // Negative values are unsupported
-    tree.update(0, -1.0).unwrap_err();
-    assert_eq!(tree.total(), 0.0);
-
-    // Negative zero is supported
-    tree.update(0, -0.0).unwrap();
-    assert_eq!(tree.total(), 0.0);
-
-    // Positive values should work
-    tree.update(1, 1.0).unwrap();
-    assert_eq!(tree.total(), 1.0);
-
-    tree.update(0, 2.0).unwrap();
-    assert_eq!(tree.total(), 3.0);
-
-    // This should be out of bounds
-    tree.sample(3.0).unwrap_err();
-
-    //    Current Tree
-    // ===================
-    //         3.0
-    //     1.0     2.0
-    //  1.0  0.0
-    // ===================
-
-    assert_eq!(tree.prios(), &[2.0, 1.0, 0.0]);
-    assert_eq!(tree.data[..], [3.0, 1.0, 2.0, 1.0, 0.0]);
-
-    assert_eq!(tree.sample(-0.0).unwrap(), (1, 1.0));
-    assert_eq!(tree.sample(0.9).unwrap(), (1, 1.0));
-    assert_eq!(tree.sample(1.0).unwrap(), (0, 2.0));
-    assert_eq!(tree.sample(2.0).unwrap(), (0, 2.0));
-    assert_eq!(tree.sample(2.9).unwrap(), (0, 2.0));
-}
-
-#[test]
-fn test_prio_tree_layout_for_every_length() {
-    // The `2 * len - 1` heap layout has to hold for lengths that are not powers of two, which is
-    // where an off-by-one in `offset` would show up.
-    for len in 1..=33 {
-        let mut tree = PrioTree::new(len).unwrap();
-        assert_eq!(tree.len(), len);
-        assert_eq!(tree.prios().len(), len);
-
-        for i in 0..len {
-            tree.update(i, (i + 1) as f32).unwrap();
+        for stratified in [false, true] {
+            let (handles, _) = tree.sample(64, &timeline, &span, stratified).unwrap();
+            assert!(
+                handles.iter().all(|handle| handle.t < 4),
+                "stratified {stratified}"
+            );
         }
 
-        let expected = (1..=len).map(|x| x as f32).sum::<f32>();
-        assert_eq!(tree.total(), expected, "wrong total for len {len}");
+        // With nothing valid the draw gives up, and with no weight it does not start.
+        let span = Span::new(7, 1, EpisodeEnd::Pad).unwrap();
+        assert!(matches!(
+            tree.sample(1, &timeline, &span, false),
+            Err(Error::Exhausted)
+        ));
+        let mut empty = PrioTree::new(1, 16, Some(0)).unwrap();
+        assert!(matches!(
+            empty.sample(1, &timeline, &span, false),
+            Err(Error::NoWeight)
+        ));
+    }
+
+    #[test]
+    fn test_prio_tree_never_draws_a_row_at_its_previous_laps_weight() {
+        // Twelve transitions through a ring of eight, but weights written only for the first
+        // eight: rows 0..4 belong to timesteps 8..12 on the timeline and still weigh what
+        // timesteps 0..4 did.
+        let (mut timeline, mut tree) = stepped(8, 8, |_| 1.0);
+        let (mut obs, mut done) = ([handle(0, 0)], [false]);
+        for _ in 0..4 {
+            timeline
+                .step(&[false], &[false], &mut obs, &mut done)
+                .unwrap();
+        }
+
+        let span = Span::new(1, 1, EpisodeEnd::Pad).unwrap();
+        let (handles, _) = tree.sample(256, &timeline, &span, true).unwrap();
         assert!(
-            (0..len).all(|i| tree.prios()[i] == (i + 1) as f32),
-            "wrong leaves for len {len}"
+            handles.iter().all(|handle| (5..8).contains(&handle.t)),
+            "{handles:?}"
         );
-    }
-}
 
-#[test]
-fn test_prio_tree_update_is_idempotent() {
-    // Internal nodes are re-derived from their children, so writing the same value again must not
-    // change anything. Accumulating into the parents instead would make the total drift upwards.
-    let mut tree = PrioTree::new(8).unwrap();
-    for i in 0..8 {
-        tree.update(i, 1.0).unwrap();
-    }
-    assert_eq!(tree.total(), 8.0);
-
-    for _ in 0..10 {
-        tree.update(3, 1.0).unwrap();
-        assert_eq!(tree.total(), 8.0);
+        // Writing past the skipped timesteps zeroes them rather than leaving them weighted.
+        tree.write(&[handle(0, 11)], &[2.0], None).unwrap();
+        assert_eq!(
+            tree.read(&[handle(0, 8), handle(0, 10), handle(0, 11)])
+                .unwrap(),
+            [0.0, 0.0, 2.0]
+        );
+        assert_eq!(tree.total(), 6.0);
     }
 
-    // Lowering a priority has to lower the total, which a delta-free re-derivation gets for free.
-    tree.update(3, 0.5).unwrap();
-    assert_eq!(tree.total(), 7.5);
-}
+    #[test]
+    fn test_prio_tree_write_checks_before_it_writes() {
+        let (_, mut tree) = stepped(4, 6, |_| 1.0);
 
-#[test]
-fn test_prio_tree_sampling_is_proportional() {
-    let mut tree = PrioTree::new(4).unwrap();
-    for i in 0..4 {
-        tree.update(i, (i + 1) as f32).unwrap();
+        for bad in [f32::NAN, f32::INFINITY, -1.0] {
+            let result = tree.write(&[handle(0, 5), handle(0, 4)], &[3.0, bad], None);
+            assert!(matches!(result, Err(Error::InvalidWeight(_))));
+        }
+        assert_eq!(tree.total(), 4.0);
+
+        let mut landed = [true; 2];
+        tree.write(
+            &[handle(0, 1), handle(0, 5)],
+            &[9.0, 3.0],
+            Some(&mut landed),
+        )
+        .unwrap();
+        assert_eq!(landed, [false, true]);
+        assert_eq!(tree.total(), 6.0);
+        assert!(matches!(tree.read(&[handle(0, 1)]), Err(Error::Dead(_))));
     }
-    assert_eq!(tree.total(), 10.0);
-
-    // Sweeping uniformly across [0, total) must hit each leaf in proportion to its priority.
-    const STEPS: usize = 10_000;
-    let mut counts = [0usize; 4];
-    for step in 0..STEPS {
-        let point = (step as f32 + 0.5) / STEPS as f32 * tree.total();
-        let (i, prio) = tree.sample(point).unwrap();
-        assert_eq!(prio, tree.prios()[i]);
-        counts[i] += 1;
-    }
-    assert_eq!(counts, [1000, 2000, 3000, 4000]);
-}
-
-#[test]
-fn test_prio_tree_never_samples_a_zero_priority() {
-    // Zeroed entries are the ones that have not been written yet. Returning one would hand out an
-    // index into uninitialised transitions, so the descent invariant has to rule it out.
-    let mut tree = PrioTree::new(16).unwrap();
-    for i in [1, 7, 8, 15] {
-        tree.update(i, 1.0).unwrap();
-    }
-
-    const STEPS: usize = 1_000;
-    for step in 0..STEPS {
-        let point = step as f32 / STEPS as f32 * tree.total();
-        let (i, prio) = tree.sample(point).unwrap();
-        assert!(prio > 0.0, "sampled unset index {i} at {point}");
-        assert!([1, 7, 8, 15].contains(&i));
-    }
-
-    // The same, with priorities spread widely enough that the internal sums round: a tiny
-    // priority next to a huge one is exactly where a node's total stops being the exact sum of
-    // its children, and where a descent that trusted `<=` would fall off the end of a subtree.
-    let mut tree = PrioTree::new(9).unwrap();
-    for (i, prio) in [(0, 1e8), (3, 1e-8), (4, 1e8), (8, 1e-8)] {
-        tree.update(i, prio).unwrap();
-    }
-
-    // Walk the largest representable points below `total`, which is where the accumulated
-    // rounding in the node sums would show up first, and sweep the range as a whole.
-    let mut point = tree.total();
-    for _ in 0..STEPS {
-        point = f32::from_bits(point.to_bits() - 1);
-        let (i, prio) = tree.sample(point).unwrap();
-        assert!(prio > 0.0, "sampled unset index {i} at {point}");
-    }
-    for step in 0..STEPS {
-        let point = step as f32 / STEPS as f32 * tree.total();
-        let (i, prio) = tree.sample(point).unwrap();
-        assert!(prio > 0.0, "sampled unset index {i} at {point}");
-    }
-    // `total` is still excluded, however close the sum is to it.
-    tree.sample(tree.total()).unwrap_err();
-}
-
-#[test]
-fn test_prio_tree_rejects_invalid_input() {
-    let mut tree = PrioTree::new(4).unwrap();
-
-    // Priorities must be finite and non-negative, or the tree's sums stop meaning anything.
-    tree.update(0, f32::NAN).unwrap_err();
-    tree.update(0, f32::INFINITY).unwrap_err();
-    tree.update(0, -1.0).unwrap_err();
-    tree.update(4, 1.0).unwrap_err();
-    assert_eq!(tree.total(), 0.0);
-
-    // An empty distribution cannot be sampled from at all.
-    tree.sample(0.0).unwrap_err();
-
-    tree.update(0, 1.0).unwrap();
-    tree.sample(-1.0).unwrap_err();
-    tree.sample(f32::NAN).unwrap_err();
-    // `total` itself is out of range: the interval is half-open.
-    tree.sample(tree.total()).unwrap_err();
-    tree.sample(tree.total() - 0.1).unwrap();
-}
-
-#[test]
-fn test_prio_tree_error_stays_bounded_over_many_updates() {
-    use rand::{RngExt, SeedableRng, rngs::Xoshiro256PlusPlus};
-
-    // The reason for choosing a segment tree over a Fenwick tree: because each parent is recomputed
-    // from its children, the root stays close to the true sum however many updates have gone
-    // through it. This is the property that would degrade if `update` ever went back to
-    // accumulating deltas.
-    const LEN: usize = 100_000;
-    let mut tree = PrioTree::new(LEN).unwrap();
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x243f_6a88_85a3_08d3);
-
-    for i in 0..LEN {
-        tree.update(i, rng.random()).unwrap();
-    }
-    for _ in 0..1_000_000 {
-        let i = rng.random_range(0..LEN);
-        tree.update(i, rng.random()).unwrap();
-    }
-
-    let reference: f64 = tree.prios().iter().map(|&p| p as f64).sum();
-    let error = (tree.total() as f64 - reference).abs() / reference;
-    assert!(
-        error < 1e-5,
-        "relative error {error:e} after 1M updates is larger than expected"
-    );
 }
