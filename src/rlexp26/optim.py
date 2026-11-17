@@ -9,8 +9,11 @@ import optax.tree_utils as otu
 from jax.typing import ArrayLike
 
 
-def inverse_sqrt_schedule(init_value: float, decay_steps: int) -> optax.Schedule:
-    """``init_value / sqrt(1 + count / decay_steps)``: constant early, ``count ** -0.5`` late."""
+def inverse_sqrt_schedule(init_value: float, decay_steps: float) -> optax.Schedule:
+    """
+    ``init_value / sqrt(1 + count / decay_steps)``: constant early, ``count ** -0.5`` late, and
+    constant throughout at ``decay_steps`` inf.
+    """
 
     def schedule(count: ArrayLike) -> jax.Array:
         return init_value / jnp.sqrt(1 + jnp.asarray(count) / decay_steps)
@@ -105,79 +108,5 @@ def add_init_pull(strength: ArrayLike) -> optax.GradientTransformation:
             state.init_params,
         )
         return updates, state
-
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
-class AddLaggedPullState(NamedTuple):
-    step: jax.Array
-    age: jax.Array
-    average: optax.Params
-    staged: optax.Params
-    anchor: optax.Params
-
-
-def add_lagged_pull(
-    boost: float, average_rate: float, refresh_every: int
-) -> optax.GradientTransformation:
-    """
-    Boosts a base optimizer's motion faster than an anchor's timescale and leaves steady motion at
-    the base's own speed. Chained after the base optimizer's learning-rate scaling, on the final
-    updates: ``boost * updates - (boost - 1) * (params - anchor) / age``. A base step steady at
-    ``u`` per step then moves the parameters at ``u``, and a short burst at ``boost * u``; the
-    anchor's spring closes ``(boost - 1) / age`` of the distance per step. 1.0 is the base alone.
-
-    The anchor is a frozen copy of the parameters' moving average: ``average`` moves
-    ``average_rate`` of the way to the parameters per step (1.0 copies them), and every
-    ``refresh_every`` steps ``anchor`` takes ``staged`` and ``staged`` takes ``average``, so the
-    anchor is the average as it stood one to two periods back; until the first such copy, at step
-    ``2 * refresh_every``, it is the initial parameters. ``age`` is the steps since the anchor's
-    state, plus the average's mean lag ``(1 - average_rate) / average_rate`` once the anchor is a
-    copy of the average, so ``(params - anchor) / age`` is the parameters' mean velocity since it.
-    """
-
-    def init_fn(params: optax.Params) -> AddLaggedPullState:
-        def copy() -> optax.Params:
-            return jax.tree.map(jnp.copy, params)
-
-        return AddLaggedPullState(
-            jnp.zeros([], jnp.int32), jnp.zeros([], jnp.float32), copy(), copy(), copy()
-        )
-
-    def update_fn(
-        updates: optax.Updates,
-        state: optax.OptState,
-        params: optax.Params | None = None,
-    ) -> tuple[optax.Updates, AddLaggedPullState]:
-        if not isinstance(state, AddLaggedPullState):
-            raise TypeError(
-                f"Expected 'state' to be an instance of AddLaggedPullState,"
-                f" got {type(state).__name__!r}"
-            )
-        assert params is not None
-        step = state.step + 1
-        average = jax.tree.map(
-            lambda a, p: a + average_rate * (p - a), state.average, params
-        )
-        refresh = step % refresh_every == 0
-        anchor = jax.tree.map(
-            lambda new, old: jnp.where(refresh, new, old), state.staged, state.anchor
-        )
-        staged = jax.tree.map(
-            lambda new, old: jnp.where(refresh, new, old), average, state.staged
-        )
-        anchor_step = jnp.maximum(0, (step // refresh_every - 1) * refresh_every)
-        age = (
-            step
-            - anchor_step
-            + jnp.where(anchor_step > 0, (1 - average_rate) / average_rate, 0.0)
-        )
-        updates = jax.tree.map(
-            lambda u, p, a: boost * u - (boost - 1) * (p - a) / age,
-            updates,
-            params,
-            anchor,
-        )
-        return updates, AddLaggedPullState(step, age, average, staged, anchor)
 
     return optax.GradientTransformation(init_fn, update_fn)

@@ -96,7 +96,7 @@ class QPolicy(Policy):
 
     def __init__(
         self,
-        act: Callable[..., tuple[jax.Array, jax.Array]],
+        act: Callable[..., tuple[jax.Array, jax.Array, jax.Array]],
         learner: tuple[jax.Array, ...],
         epsilon: float,
     ) -> None:
@@ -119,7 +119,7 @@ class QPolicy(Policy):
         episode_start: npt.NDArray[np.bool_],
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
         key, step = state
-        actions, step = self._act(self._learner, obs, key, step, self._epsilon)
+        actions, _, step = self._act(self._learner, obs, key, step, self._epsilon)
         return actions, (key, step)
 
 
@@ -199,6 +199,8 @@ class QLearner(Agent):
         self._uploaded: tuple[Draw, Batch] | None = None
         self._memory: ReplayMemory | None = None
         self._num_heldout = 0
+        self._ignored = np.zeros(0, bool)
+        self._acting_nll_sum, self._acting_nll_count = 0.0, 0
         self._max_prio = 1.0
         self._num_updates = 0
         self._num_env_steps = 0
@@ -230,10 +232,11 @@ class QLearner(Agent):
         epsilon: jax.Array,
         *,
         soft: bool,
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """
         One action per environment from the learner of ``leaves``, under a fresh draw of the
-        net's noise, and ``step + 1``. The randomness is ``key`` folded with ``step``.
+        net's noise, its ``-ln`` probability under the epsilon-mixed policy it was drawn from,
+        and ``step + 1``. The randomness is ``key`` folded with ``step``.
         """
         learner: Learner = jax.tree.unflatten(self._structure, leaves)
         forward_key, policy_key, epsilon_key, random_key = jr.split(
@@ -246,16 +249,26 @@ class QLearner(Agent):
             key=forward_key,
         )
         qs = self._act_returns.means(out)
+        num_actions = qs.shape[-1]
         if soft:
-            actions = jr.categorical(policy_key, qs / self._temperature)
+            log_policy = jax.nn.log_softmax(qs / self._temperature)
+            actions = jr.categorical(policy_key, log_policy)
         else:
             actions = jnp.argmax(qs, -1)
+            log_policy = jnp.where(
+                jax.nn.one_hot(actions, num_actions, dtype=bool), 0.0, -jnp.inf
+            )
         actions = jnp.where(
             jr.uniform(epsilon_key, actions.shape) < epsilon,
-            jr.randint(random_key, actions.shape, 0, qs.shape[-1]),
+            jr.randint(random_key, actions.shape, 0, num_actions),
             actions,
         )
-        return actions, step + 1
+        log_probs = jnp.logaddexp(
+            jnp.log1p(-epsilon)
+            + jnp.take_along_axis(log_policy, actions[:, None], -1)[:, 0],
+            jnp.log(epsilon / num_actions),
+        )
+        return actions, -log_probs, step + 1
 
     def _loss(
         self,
@@ -488,6 +501,7 @@ class QLearner(Agent):
     @override
     def init(self, obs: npt.NDArray[Any], *, num_heldout: int) -> None:
         self._num_heldout = num_heldout
+        self._ignored = np.zeros(len(obs) - num_heldout, bool)
         self._memory = ReplayMemory(
             self._replay,
             obs,
@@ -511,19 +525,26 @@ class QLearner(Agent):
         episode_start: npt.NDArray[np.bool_],
     ) -> tuple[jax.Array, dict[str, jax.Array]]:
         self._num_env_steps = num_env_steps
-        actions, _ = self._act(
+        actions, neg_log_probs, _ = self._act(
             self._learner,
             obs,
             self._act_key,
             num_env_steps,
             self._epsilon(num_env_steps),
         )
-        return actions, {}
+        jax.copy_to_host_async(neg_log_probs)  # type: ignore[no-untyped-call]
+        return actions, {"neg_log_probs": neg_log_probs}
 
     @override
     def observe(self, step: EnvStep) -> None:
         assert self._memory is not None, "observe before init"
         self._memory.observe(step)
+        # An action on an episode's last observation is ignored by the autoreset.
+        acted = ~self._ignored
+        neg_log_probs = np.asarray(step.extras["neg_log_probs"])[: len(acted)][acted]
+        self._acting_nll_sum += float(neg_log_probs.sum())
+        self._acting_nll_count += len(neg_log_probs)
+        self._ignored = (step.terminated | step.truncated)[: len(acted)]
 
     @override
     def learn_step(self) -> tuple[int, dict[str, jax.Array]]:
@@ -667,6 +688,12 @@ class QLearner(Agent):
     @override
     def stats(self) -> dict[str, float]:
         stats = {"policy/epsilon": self._epsilon(self._num_env_steps)}
+        if self._acting_nll_count:
+            # The acting policy's entropy, sampled over the steps since the last read.
+            stats["policy/acting_neg_log_prob"] = (
+                self._acting_nll_sum / self._acting_nll_count
+            )
+            self._acting_nll_sum, self._acting_nll_count = 0.0, 0
         if self._memory is not None:
             stats |= {
                 "replay/size": float(len(self._memory)),

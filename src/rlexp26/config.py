@@ -178,26 +178,26 @@ class MXQ2:
     augment_pad: Annotated[int, Arg(default=Env("AUGMENT_PAD"))] = 4
     augment_intensity: Annotated[float, Arg(default=Env("AUGMENT_INTENSITY"))] = 0.05
     # Each group has its own Adam. A rate with decay steps is rate / sqrt(1 + t / steps) at
-    # gradient step t. learning_rate is every other parameter's.
+    # gradient step t, constant at inf. learning_rate is every other parameter's.
     head_input_learning_rate: Annotated[
         float, Arg(default=Env("HEAD_INPUT_LEARNING_RATE"))
     ] = 5e-3
     head_learning_rate: Annotated[float, Arg(default=Env("HEAD_LEARNING_RATE"))] = 5e-3
     # Both head groups'.
-    head_lr_decay_steps: Annotated[int, Arg(default=Env("HEAD_LR_DECAY_STEPS"))] = (
+    head_lr_decay_steps: Annotated[float, Arg(default=Env("HEAD_LR_DECAY_STEPS"))] = (
         20_000
     )
     trunk_learning_rate: Annotated[float, Arg(default=Env("TRUNK_LEARNING_RATE"))] = (
         2e-3
     )
-    trunk_lr_decay_steps: Annotated[int, Arg(default=Env("TRUNK_LR_DECAY_STEPS"))] = (
+    trunk_lr_decay_steps: Annotated[float, Arg(default=Env("TRUNK_LR_DECAY_STEPS"))] = (
         200_000
     )
     readout_kernel_learning_rate: Annotated[
         float, Arg(default=Env("READOUT_KERNEL_LEARNING_RATE"))
     ] = 1e-3
     readout_kernel_lr_decay_steps: Annotated[
-        int, Arg(default=Env("READOUT_KERNEL_LR_DECAY_STEPS"))
+        float, Arg(default=Env("READOUT_KERNEL_LR_DECAY_STEPS"))
     ] = 20_000
     # The readout batch renorm's, under pooled Adam.
     readout_scale_learning_rate: Annotated[
